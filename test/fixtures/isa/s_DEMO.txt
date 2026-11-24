@@ -1,0 +1,6 @@
+Source Name	Sample Name	Characteristics[Organism]	Characteristics[Gender]	Characteristics[Age]	Factor Value[Group]
+source_1	Sample_1	Homo sapiens	Male	30	Case
+source_2	Sample_2	Homo sapiens	Female	31	Case
+source_3	Sample_3	Homo sapiens	Male	32	Case
+source_4	Sample_4	Homo sapiens	Female	33	Control
+source_5	Sample_5	Homo sapiens	Male	34	Control

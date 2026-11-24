@@ -1,0 +1,12 @@
+MTD	mzTab-version	1.0.0
+MTD	mzTab-mode	Summary
+MTD	mzTab-type	Quantification
+MTD	description	metabolomics fixture
+MTD	species[1]-name	Homo sapiens
+MTD	species[1]-taxid	9606
+MTD	assay[1]-name	Sample_A
+MTD	assay[2]-name	Sample_B
+SMH	SMF_ID	database_identifier	chemical_formula	mass_to_charge	retention_time	name	abundance_assay[1]	abundance_assay[2]
+SML	1	HMDB0000660	C6H12O6	180.0634	1.2	Fructose	1000	2000
+SML	2	HMDB0000122	C6H12O6	203.0526	2.0	Glucose	1500	2500
+SML	3	HMDB0000883	C5H11NO2	118.0863	0.6	Valine	500	750

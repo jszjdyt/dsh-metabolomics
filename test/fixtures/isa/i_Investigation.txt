@@ -1,0 +1,12 @@
+ONTOLOGY SOURCE REFERENCE
+Term Source Name	BTO	CHEBI	EFO	MS	MTBLS	NCBITaxon	OBI
+Term Source File	http://purl.obolibrary.org/obo/bto.owl	http://purl.obolibrary.org/obo/chebi.owl	http://www.ebi.ac.uk/efo/efo.owl	http://purl.obolibrary.org/obo/ms.owl	https://github.com/EBI-Metabolights/MtblsWS-Py	http://purl.obolibrary.org/obo/ncbitaxon.owl	http://purl.obolibrary.org/obo/obi.owl
+INVESTIGATION
+Study Identifier	MTBLS_DEMO
+Study Title	Metabolomics fixture study
+Study Description	Synthetic ISA-Tab study for import tests.
+Study Submission Date	2024-01-01
+Study Public Release Date	2024-01-01
+Study Assay Technology Type	mass spectrometry
+STUDY ASSAYS
+Study Assay File Name	a_DEMO.txt
