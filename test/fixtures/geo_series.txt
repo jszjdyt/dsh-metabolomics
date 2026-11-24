@@ -1,0 +1,16 @@
+!Series_title	"Fixture metabolomics series"
+!Series_geo_accession	"GSE999999"
+!Series_summary	"Synthetic series matrix for import tests."
+!Series_overall_design	"3 samples, 4 features."
+!Sample_title	"case_1"	"control_1"	"case_2"
+!Sample_geo_accession	"GSM1000001"	"GSM1000002"	"GSM1000003"
+!Sample_organism_ch1	"Homo sapiens"	"Homo sapiens"	"Homo sapiens"
+!Sample_characteristics_ch1	"group: case"	"group: control"	"group: case"
+!Sample_characteristics_ch1	"age: 45"	"age: 52"	"age: 61"
+!series_matrix_table_begin
+"ID_REF"	"GSM1000001"	"GSM1000002"	"GSM1000003"
+"FEATURE_A"	10	20	"NA"
+"FEATURE_B"	30	40	50
+"FEATURE_C"	60	"NA"	80
+"FEATURE_D"	90	100	110
+!series_matrix_table_end

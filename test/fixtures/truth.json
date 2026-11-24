@@ -1,0 +1,831 @@
+{
+ "root": "test/fixtures",
+ "cases": {
+  "samples_x_features": {
+   "file": "test/fixtures/samples_x_features.csv",
+   "format": "matrix_text",
+   "n_samples": 8,
+   "n_features": 6,
+   "samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8"
+   ],
+   "features": [
+    "mz203.0526_rt1.23",
+    "mz180.0634_rt2.10",
+    "mz118.0863_rt0.90",
+    "mz300.1234_rt5.50",
+    "mz450.7890_rt7.25",
+    "mz512.3456_rt9.10"
+   ],
+   "digest": "03463423df84a841",
+   "n_missing": 2,
+   "sum": 105279.0,
+   "matrix": [
+    [
+     3976.0,
+     2681.0,
+     2920.0,
+     3783.0,
+     2492.0,
+     3291.0
+    ],
+    [
+     3526.0,
+     1062.0,
+     374.0,
+     1365.0,
+     1304.0,
+     3687.0
+    ],
+    [
+     3846.0,
+     171.0,
+     2174.0,
+     null,
+     682.0,
+     3378.0
+    ],
+    [
+     632.0,
+     2045.0,
+     3456.0,
+     1377.0,
+     1533.0,
+     1277.0
+    ],
+    [
+     3063.0,
+     1182.0,
+     4161.0,
+     1952.0,
+     2086.0,
+     2193.0
+    ],
+    [
+     2509.0,
+     0.0,
+     2213.0,
+     4181.0,
+     3421.0,
+     3360.0
+    ],
+    [
+     2986.0,
+     2669.0,
+     1531.0,
+     4155.0,
+     null,
+     1022.0
+    ],
+    [
+     3572.0,
+     798.0,
+     3622.0,
+     2630.0,
+     614.0,
+     327.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "trailing_rows_dropped": 1
+  },
+  "features_x_samples": {
+   "file": "test/fixtures/features_x_samples.tsv",
+   "format": "matrix_text",
+   "n_samples": 8,
+   "n_features": 5,
+   "samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8"
+   ],
+   "features": [
+    "mz203.0526_rt1.23",
+    "mz180.0634_rt2.10",
+    "mz118.0863_rt0.90",
+    "mz146.1176_rt1.05",
+    "mz408.2876_rt12.40"
+   ],
+   "digest": "5939e66b4bbf909e",
+   "n_missing": 1,
+   "sum": 113196.0,
+   "matrix": [
+    [
+     869.0,
+     2627.0,
+     3972.0,
+     2418.0,
+     1438.0
+    ],
+    [
+     842.0,
+     939.0,
+     4941.0,
+     3514.0,
+     3551.0
+    ],
+    [
+     4185.0,
+     null,
+     5097.0,
+     5172.0,
+     2494.0
+    ],
+    [
+     2696.0,
+     4841.0,
+     3309.0,
+     1576.0,
+     2761.0
+    ],
+    [
+     3150.0,
+     2938.0,
+     4541.0,
+     4478.0,
+     4906.0
+    ],
+    [
+     3207.0,
+     552.0,
+     2044.0,
+     889.0,
+     4283.0
+    ],
+    [
+     3760.0,
+     2913.0,
+     928.0,
+     1938.0,
+     4395.0
+    ],
+    [
+     343.0,
+     848.0,
+     2756.0,
+     4140.0,
+     2945.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "feature_info": {
+    "name": [
+     "Glucose",
+     "Fructose",
+     "Valine",
+     "Glutamine",
+     "Chenodeoxycholic acid"
+    ],
+    "formula": [
+     "C6H12O6",
+     "C6H12O6",
+     "C5H11NO2",
+     "C5H10N2O3",
+     "C24H40O4"
+    ],
+    "hmdb": [
+     "HMDB0000122",
+     "HMDB0000660",
+     "HMDB0000883",
+     "HMDB0000641",
+     "HMDB0000518"
+    ],
+    "mz": [
+     203.0526,
+     180.0634,
+     118.0863,
+     146.1176,
+     408.2876
+    ],
+    "rt": [
+     1.23,
+     2.1,
+     0.9,
+     1.05,
+     12.4
+    ]
+   }
+  },
+  "xlsx": {
+   "file": "test/fixtures/metabo.xlsx",
+   "format": "xlsx",
+   "n_samples": 8,
+   "n_features": 5,
+   "samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8"
+   ],
+   "features": [
+    "mz203.0526_rt1.23",
+    "mz180.0634_rt2.10",
+    "mz118.0863_rt0.90",
+    "mz146.1176_rt1.05",
+    "mz408.2876_rt12.40"
+   ],
+   "digest": "5939e66b4bbf909e",
+   "n_missing": 1,
+   "sum": 113196.0,
+   "matrix": [
+    [
+     869.0,
+     2627.0,
+     3972.0,
+     2418.0,
+     1438.0
+    ],
+    [
+     842.0,
+     939.0,
+     4941.0,
+     3514.0,
+     3551.0
+    ],
+    [
+     4185.0,
+     null,
+     5097.0,
+     5172.0,
+     2494.0
+    ],
+    [
+     2696.0,
+     4841.0,
+     3309.0,
+     1576.0,
+     2761.0
+    ],
+    [
+     3150.0,
+     2938.0,
+     4541.0,
+     4478.0,
+     4906.0
+    ],
+    [
+     3207.0,
+     552.0,
+     2044.0,
+     889.0,
+     4283.0
+    ],
+    [
+     3760.0,
+     2913.0,
+     928.0,
+     1938.0,
+     4395.0
+    ],
+    [
+     343.0,
+     848.0,
+     2756.0,
+     4140.0,
+     2945.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "sheet": "data"
+  },
+  "xlsx_ambiguous": {
+   "file": "test/fixtures/multisheet.xlsx",
+   "format": "xlsx",
+   "ambiguous": true,
+   "candidates": [
+    "run1",
+    "run2"
+   ],
+   "expected_shape": [
+    2,
+    2
+   ]
+  },
+  "gzip": {
+   "file": "test/fixtures/samples_x_features.tsv.gz",
+   "format": "matrix_text",
+   "n_samples": 8,
+   "n_features": 6,
+   "samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8"
+   ],
+   "features": [
+    "mz203.0526_rt1.23",
+    "mz180.0634_rt2.10",
+    "mz118.0863_rt0.90",
+    "mz300.1234_rt5.50",
+    "mz450.7890_rt7.25",
+    "mz512.3456_rt9.10"
+   ],
+   "digest": "03463423df84a841",
+   "n_missing": 2,
+   "sum": 105279.0,
+   "matrix": [
+    [
+     3976.0,
+     2681.0,
+     2920.0,
+     3783.0,
+     2492.0,
+     3291.0
+    ],
+    [
+     3526.0,
+     1062.0,
+     374.0,
+     1365.0,
+     1304.0,
+     3687.0
+    ],
+    [
+     3846.0,
+     171.0,
+     2174.0,
+     null,
+     682.0,
+     3378.0
+    ],
+    [
+     632.0,
+     2045.0,
+     3456.0,
+     1377.0,
+     1533.0,
+     1277.0
+    ],
+    [
+     3063.0,
+     1182.0,
+     4161.0,
+     1952.0,
+     2086.0,
+     2193.0
+    ],
+    [
+     2509.0,
+     0.0,
+     2213.0,
+     4181.0,
+     3421.0,
+     3360.0
+    ],
+    [
+     2986.0,
+     2669.0,
+     1531.0,
+     4155.0,
+     null,
+     1022.0
+    ],
+    [
+     3572.0,
+     798.0,
+     3622.0,
+     2630.0,
+     614.0,
+     327.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true
+  },
+  "zero_table": {
+   "file": "test/fixtures/feature_table_mz_rt.tsv",
+   "format": "matrix_text",
+   "n_samples": 4,
+   "n_features": 4,
+   "samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4"
+   ],
+   "features": [
+    "mz100.0500_rt0.50",
+    "mz150.0750_rt1.10",
+    "mz250.1250_rt2.20",
+    "mz350.1750_rt3.30"
+   ],
+   "digest": "59174dccc55f7dd8",
+   "n_missing": 1,
+   "sum": 32611.0,
+   "matrix": [
+    [
+     661.0,
+     1685.0,
+     0.0,
+     null
+    ],
+    [
+     3622.0,
+     1078.0,
+     3440.0,
+     1408.0
+    ],
+    [
+     2400.0,
+     3226.0,
+     3466.0,
+     1407.0
+    ],
+    [
+     3386.0,
+     1011.0,
+     4340.0,
+     1481.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "zero_cell": [
+    0,
+    2
+   ]
+  },
+  "archive_single": {
+   "file": "test/fixtures/features.zip",
+   "format": "matrix_text",
+   "n_samples": 8,
+   "n_features": 3,
+   "samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8"
+   ],
+   "features": [
+    "mz203.0526_rt1.23",
+    "mz180.0634_rt2.10",
+    "mz118.0863_rt0.90"
+   ],
+   "digest": "095436f129c2a9a9",
+   "n_missing": 0,
+   "sum": 55169.0,
+   "matrix": [
+    [
+     3976.0,
+     2681.0,
+     2920.0
+    ],
+    [
+     3526.0,
+     1062.0,
+     374.0
+    ],
+    [
+     3846.0,
+     171.0,
+     2174.0
+    ],
+    [
+     632.0,
+     2045.0,
+     3456.0
+    ],
+    [
+     3063.0,
+     1182.0,
+     4161.0
+    ],
+    [
+     2509.0,
+     0.0,
+     2213.0
+    ],
+    [
+     2986.0,
+     2669.0,
+     1531.0
+    ],
+    [
+     3572.0,
+     798.0,
+     3622.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "member": "data/feature_table.csv"
+  },
+  "archive_multi": {
+   "file": "test/fixtures/multi_candidate.zip",
+   "format": "archive",
+   "ambiguous": true,
+   "candidates": [
+    "a_table.csv",
+    "b_table.csv"
+   ],
+   "member": "b_table.csv",
+   "member_features": [
+    "mz111.1111_rt1.11",
+    "mz222.2222_rt2.22"
+   ],
+   "member_samples": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8"
+   ]
+  },
+  "mztab": {
+   "file": "test/fixtures/study.mztab",
+   "format": "mztab",
+   "n_samples": 2,
+   "n_features": 3,
+   "samples": [
+    "Sample_A",
+    "Sample_B"
+   ],
+   "features": [
+    "mz180.0634_rt1.20",
+    "mz203.0526_rt2.00",
+    "mz118.0863_rt0.60"
+   ],
+   "digest": "c42c9934d59b6a70",
+   "n_missing": 0,
+   "sum": 8250.0,
+   "matrix": [
+    [
+     1000.0,
+     1500.0,
+     500.0
+    ],
+    [
+     2000.0,
+     2500.0,
+     750.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "feature_info": {
+    "name": [
+     "Fructose",
+     "Glucose",
+     "Valine"
+    ],
+    "formula": [
+     "C6H12O6",
+     "C6H12O6",
+     "C5H11NO2"
+    ],
+    "hmdb": [
+     "HMDB0000660",
+     "HMDB0000122",
+     "HMDB0000883"
+    ]
+   }
+  },
+  "isa_tab": {
+   "file": "test/fixtures/isa/m_DEMO_metabolite_profiling_v2_maf.tsv",
+   "format": "isa_tab",
+   "n_samples": 5,
+   "n_features": 4,
+   "samples": [
+    "Sample_1",
+    "Sample_2",
+    "Sample_3",
+    "Sample_4",
+    "Sample_5"
+   ],
+   "features": [
+    "mz180.0634_rt1.20",
+    "mz203.0526_rt2.00",
+    "mz118.0863_rt0.60",
+    "mz146.1176_rt1.10"
+   ],
+   "digest": "2ad21479bcfbad0c",
+   "n_missing": 0,
+   "sum": 28000.0,
+   "matrix": [
+    [
+     1200.0,
+     1300.0,
+     800.0,
+     700.0
+    ],
+    [
+     1500.0,
+     1600.0,
+     900.0,
+     800.0
+    ],
+    [
+     1800.0,
+     1900.0,
+     1000.0,
+     900.0
+    ],
+    [
+     2100.0,
+     2200.0,
+     1100.0,
+     1000.0
+    ],
+    [
+     2400.0,
+     2500.0,
+     1200.0,
+     1100.0
+    ]
+   ],
+   "has_mz": true,
+   "has_rt": true,
+   "folder": "test/fixtures/isa",
+   "sample_columns": [
+    "characteristics_organism",
+    "characteristics_gender",
+    "characteristics_age",
+    "factor_value_group"
+   ]
+  },
+  "msms_library": {
+   "file": "test/fixtures/library.msp",
+   "format": "msms_library",
+   "n_spectra": 3,
+   "ids": [
+    "Glucose",
+    "Fructose",
+    "Valine"
+   ],
+   "precursor_mz": [
+    203.0526,
+    203.0526,
+    118.0863
+   ],
+   "n_peaks": [
+    3,
+    3,
+    2
+   ]
+  },
+  "mzml_tic": {
+   "file": "test/fixtures/tiny.mzML",
+   "format": "mzml_tic",
+   "tic_time": [
+    0.5,
+    1.5,
+    2.5,
+    3.5
+   ],
+   "tic_intensity": [
+    1000.0,
+    2500.0,
+    1800.0,
+    900.0
+   ],
+   "n_spectra": 1,
+   "ms2_precursor": 118.0863,
+   "ms2_peaks": [
+    [
+     72.0813,
+     800.0
+    ],
+    [
+     118.0863,
+     600.0
+    ]
+   ]
+  },
+  "geo_series": {
+   "file": "test/fixtures/geo_series.txt",
+   "format": "geo_series",
+   "n_samples": 3,
+   "n_features": 4,
+   "samples": [
+    "GSM1000001",
+    "GSM1000002",
+    "GSM1000003"
+   ],
+   "features": [
+    "FEATURE_A",
+    "FEATURE_B",
+    "FEATURE_C",
+    "FEATURE_D"
+   ],
+   "digest": "c3c9119ea24f6296",
+   "n_missing": 2,
+   "sum": 590.0,
+   "matrix": [
+    [
+     10.0,
+     30.0,
+     60.0,
+     90.0
+    ],
+    [
+     20.0,
+     40.0,
+     null,
+     100.0
+    ],
+    [
+     null,
+     50.0,
+     80.0,
+     110.0
+    ]
+   ],
+   "has_mz": false,
+   "has_rt": false,
+   "organism": "Homo sapiens",
+   "sample_columns": [
+    "group",
+    "age",
+    "title",
+    "geo_accession"
+   ]
+  },
+  "no_header": {
+   "file": "test/fixtures/matrix_no_header.tsv",
+   "format": "matrix_text",
+   "n_samples": 3,
+   "n_features": 5,
+   "samples": [
+    "0",
+    "1",
+    "2"
+   ],
+   "features": [
+    "0",
+    "1",
+    "2",
+    "3",
+    "4"
+   ],
+   "digest": "fc61b9034bd4425b",
+   "n_missing": 0,
+   "sum": 120.0,
+   "matrix": [
+    [
+     1.0,
+     4.0,
+     7.0,
+     10.0,
+     13.0
+    ],
+    [
+     2.0,
+     5.0,
+     8.0,
+     11.0,
+     14.0
+    ],
+    [
+     3.0,
+     6.0,
+     9.0,
+     12.0,
+     15.0
+    ]
+   ],
+   "has_mz": false,
+   "has_rt": false
+  },
+  "bad": {
+   "empty": "test/fixtures/bad/empty.csv",
+   "binary": "test/fixtures/bad/binary.bin",
+   "broken_zip": "test/fixtures/bad/broken.zip",
+   "broken_xlsx": "test/fixtures/bad/broken.xlsx",
+   "text_only": "test/fixtures/bad/text_only.csv"
+  },
+  "info_tables": {
+   "sample_sheet": "test/fixtures/sample_sheet.csv",
+   "clinical": "test/fixtures/clinical.csv"
+  }
+ }
+}

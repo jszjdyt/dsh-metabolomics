@@ -1,0 +1,6 @@
+Sample Name	Raw Spectral Data File	Factor Value[Group]
+Sample_1	Sample_1.mzML	Case
+Sample_2	Sample_2.mzML	Case
+Sample_3	Sample_3.mzML	Case
+Sample_4	Sample_4.mzML	Control
+Sample_5	Sample_5.mzML	Control

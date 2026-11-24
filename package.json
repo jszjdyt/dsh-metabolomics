@@ -1,0 +1,57 @@
+{
+  "name": "dsh-metabolomics",
+  "version": "0.1.0",
+  "private": true,
+  "description": "代谢组学工作台：GEO/MetaboLights 检索下载 → LC-MS 特征表导入 → 质控/归一化 → PLS-DA/OPLS-DA → 差异/通路/标志物/鉴定，Agent 可用同一套工具驱动。",
+  "icon": "icon.svg",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "lib/*.mjs",
+    "lib/*.py",
+    "test/make_fixtures.py",
+    "test/make_demo.py",
+    "README.md",
+    "DESIGN.md",
+    "requirements.txt",
+    "INSTALL.md",
+    "!lib/__pycache__/**",
+    "!lib/*.bak-*",
+    "!lib/impl.mjs.bak-*"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "metabolomics",
+    "lc-ms",
+    "pls-da",
+    "mummichog",
+    "pathway-enrichment",
+    "biomarker"
+  ],
+  "license": "MIT"
+}
