@@ -895,11 +895,18 @@ def _de_frame(ctx) -> pd.DataFrame:
 
 
 def _significant(de: pd.DataFrame, p_cut: float, fc: float | None = None) -> pd.DataFrame:
-    """显著特征：p_adj < p_cut（可选再要求 |log2FC| ≥ fc），按 |log2FC| 降序。"""
+    """显著特征：p_adj < p_cut（可选再要求 |FC| ≥ fc），按 |log2FC| 降序。
+
+    ``fc`` 是**倍数**（如 1.5 = 50% 变化），log2FC 是 log2 尺度，两者必须先换算到同一口径：
+    |log2FC| ≥ log2(fc)（BIO_P0_BACKLOG §4 P0-3 的 fc/log2FC 口径一致性）。旧实现直接拿
+    |log2FC| 和倍数比较，fc=1.5 实际卡在 2^1.5≈2.83 倍，等于默认更严。
+    """
     mask = de["p_adj"].to_numpy(float) < float(p_cut)
     if fc is not None:
         try:
-            mask &= np.abs(de["log2FC"].to_numpy(float)) >= float(fc)
+            fold = float(fc)
+            if np.isfinite(fold) and fold > 1.0:
+                mask &= np.abs(de["log2FC"].to_numpy(float)) >= math.log2(fold) - 1e-12
         except (TypeError, ValueError):
             pass
     sub = de.loc[mask].copy()
@@ -1562,6 +1569,11 @@ def _enrich_payload(frame: pd.DataFrame, label_key: str, label_title: str, title
             data_out.append(data_file("enrich_csv", path, "通路富集表（完整）"))
         except Exception as error:  # noqa: BLE001 - 写文件失败只降级
             warnings.append(f"导出富集表失败：{error}")
+    else:
+        # 零显著/零命中是合法结果：仍然返回带列名的空表（total=0），不伪造行、不画无数据的图
+        tables.append(table(
+            "enrich", f"{label_title}富集结果（空）", _table_columns(label_key, label_title), rows=[],
+            note=method_text + "；本次没有可报告的富集条目（空结果，不是失败）"))
     bullets = _bullets(frame, label_key, method_text, params, label_title)
     summary_metrics = {
         "n_features": int(metrics.get("n_features", 0)) if metrics else 0,
@@ -1605,46 +1617,82 @@ def _bullets(frame: pd.DataFrame, label_key: str, method_text: str, params: dict
 # ---------------------------------------------------------------------------
 
 
+def _zero_significant_payload(ctx, params: dict, outdir: str, *, title: str,
+                              method_text: str, label_key: str = "pathway",
+                              label_title: str = "通路", fig_title: str = "Pathway enrichment",
+                              p_cut: float = DEFAULT_P_CUT, file_stem: str = "enrich") -> dict:
+    """零显著是合法结果：返回带列名的空表 + n_significant=0 + warning（不退化为 top50）。"""
+    notes = ["零显著时不做全量排序富集；如需基于全基因/全代谢物排序的通路富集，"
+             "请单独运行 metabolite_set_enrich（MSEA，秩基 GSEA 思想）"]
+    warnings = [f"p_adj<{p_cut:g} 的显著特征为 0（零显著是合法结果，不是富集失败）："
+                f"富集结果为空表"]
+    empty = _enrich_frame([], label_key)
+    return _enrich_payload(empty, label_key, label_title, title, method_text, notes, warnings,
+                           outdir, params,
+                           metrics={"n_features": int(len(_feature_list(ctx))), "n_significant": 0},
+                           store_extra={"significant": []}, fig_title=fig_title,
+                           file_stem=file_stem)
+
+
 def step_enrich(ctx, params, outdir):
-    """STEP enrich：默认 Mummichog 质量匹配；method=ora_kegg 时走注释超几何。"""
+    """STEP enrich：默认 Mummichog 质量匹配；method=ora_kegg 时走注释超几何。
+
+    零显著（p_adj < p_cut 的特征为 0）是**合法结果**：返回带列名的空表、n_significant=0
+    与 warning，绝不退化成「按 |log2FC| 取 top50 再计为显著」（BIO_P0_BACKLOG §4 P0-3）。
+    全量排序富集由 ``metabolite_set_enrich``（MSEA）单独承担。
+    """
     params = dict(params or {})
     method = str(params.get("method") or "mummichog").strip().lower()
     notes: list[str] = []
     warnings: list[str] = []
     de = _de_frame(ctx)
     p_cut = float(params.get("p_cut") or DEFAULT_P_CUT)
+    if method in ("ora_kegg", "ora", "kegg"):
+        title = "KEGG 通路 ORA"
+        method_text = "内置实现（KEGG 通路 ORA 超几何 + BH；依据 Kanehisa 2023）"
+        fig_title = "KEGG pathway ORA"
+    elif method in ("mummichog", "mummichog_pathway", "auto"):
+        title = "Mummichog 式通路富集"
+        method_text = "内置实现（Mummichog 质量映射 + 置换；依据 Li 2013 / Uppal 2017）"
+        fig_title = "Mummichog pathway enrichment"
+    else:
+        raise bad_request(f"未知富集方法「{method}」（可选：mummichog / ora_kegg）")
+
     sig = _significant(de, p_cut, params.get("fc"))
+    n_features = int(len(_feature_list(ctx)))
     if sig.empty:
-        fallback = de.reindex(de["log2FC"].abs().sort_values(ascending=False).index).head(50)
-        warnings.append(
-            f"p_adj<{p_cut:g} 的显著特征为 0，已退化为按 |log2FC| 取前 {len(fallback)} 个特征做富集"
+        reason = f"p_adj<{p_cut:g} 的显著特征为 0（零显著是合法结果，不是富集失败）"
+        warnings.append(reason + "：富集结果为空表；不再退化为按 |log2FC| 取 top50 当显著特征")
+        notes.append(
+            "零显著时不做全量排序富集；如需基于全基因/全代谢物排序的通路富集，"
+            "请单独运行 metabolite_set_enrich（MSEA，秩基 GSEA 思想）"
         )
-        sig = fallback.reset_index(drop=True)
+        empty = _enrich_frame([], "pathway")
+        return _enrich_payload(empty, "pathway", "通路", title, method_text, notes, warnings,
+                               outdir, params,
+                               metrics={"n_features": n_features, "n_significant": 0},
+                               store_extra={"significant": []},
+                               fig_title=fig_title)
     if len(sig) > MAX_SIG:
         warnings.append(f"显著特征 {len(sig)} 个超过上限，按 |log2FC| 取前 {MAX_SIG} 个")
         sig = sig.head(MAX_SIG)
     library, extra_masses = _load_library(ctx, params, notes, warnings)
     sig_features = [f for f in sig["feature"].astype(str).tolist()]
-    metrics = {"n_features": int(len(_feature_list(ctx))), "n_significant": int(len(sig_features))}
+    metrics = {"n_features": n_features, "n_significant": int(len(sig_features))}
 
     if method in ("ora_kegg", "ora", "kegg"):
         membership = _pathway_membership(ctx, library, notes)
         frame = _ora(ctx, membership, "pathway", sig_features, params, notes)
-        method_text = "内置实现（KEGG 通路 ORA 超几何 + BH；依据 Kanehisa 2023）"
         label_key, label_title = "pathway", "通路"
-        title = "KEGG 通路 ORA"
-    elif method in ("mummichog", "mummichog_pathway", "auto"):
+    else:
         frame, method_text, label_key = _mummichog_with_fallback(
             ctx, sig, params, library, extra_masses, notes, warnings)
         label_title = "通路"
-        title = "Mummichog 式通路富集"
-    else:
-        raise bad_request(f"未知富集方法「{method}」（可选：mummichog / ora_kegg）")
 
     return _enrich_payload(frame, label_key, label_title, title, method_text, notes, warnings,
                            outdir, params, metrics=metrics,
                            store_extra={"significant": sig_features[:500]},
-                           fig_title="Mummichog pathway enrichment")
+                           fig_title=fig_title)
 
 
 # ---------------------------------------------------------------------------
@@ -1661,7 +1709,10 @@ def analysis_mummichog_pathway(ctx, params, outdir):
     p_cut = float(params.get("p_cut") or DEFAULT_P_CUT)
     sig = _significant(de, p_cut, params.get("fc"))
     if sig.empty:
-        raise prerequisite(f"当前阈值（p_adj<{p_cut:g}）下没有显著差异特征，请先放宽差异分析的 FDR 或 p_cut")
+        return _zero_significant_payload(
+            ctx, params, outdir, title="Mummichog 式通路富集",
+            method_text="内置实现（Mummichog 质量映射 + 置换；依据 Li 2013 / Uppal 2017）",
+            fig_title="Mummichog pathway enrichment", p_cut=p_cut)
     if len(sig) > MAX_SIG:
         sig = sig.head(MAX_SIG)
         warnings.append(f"显著特征超过上限，按 |log2FC| 取前 {MAX_SIG} 个")
@@ -1685,7 +1736,10 @@ def analysis_ora_kegg(ctx, params, outdir):
     p_cut = float(params.get("p_cut") or DEFAULT_P_CUT)
     sig = _significant(de, p_cut, params.get("fc"))
     if sig.empty:
-        raise prerequisite(f"当前阈值（p_adj<{p_cut:g}）下没有显著差异特征，无法做 ORA")
+        return _zero_significant_payload(
+            ctx, params, outdir, title="KEGG 通路 ORA",
+            method_text="内置实现（KEGG 通路超几何 + BH；依据 Kanehisa 2023）",
+            fig_title="KEGG pathway ORA", p_cut=p_cut)
     library, _ = _load_library(ctx, params, notes, warnings)
     membership = _pathway_membership(ctx, library, notes)
     sig_features = sig["feature"].astype(str).tolist()
@@ -1706,7 +1760,11 @@ def analysis_ora_hmdb_class(ctx, params, outdir):
     p_cut = float(params.get("p_cut") or DEFAULT_P_CUT)
     sig = _significant(de, p_cut, params.get("fc"))
     if sig.empty:
-        raise prerequisite(f"当前阈值（p_adj<{p_cut:g}）下没有显著差异特征，无法做化学分类富集")
+        return _zero_significant_payload(
+            ctx, params, outdir, title="HMDB 化学分类富集",
+            method_text="内置实现（HMDB 化学分类超几何 + BH；依据 Wishart 2022）",
+            label_key="class", label_title="化学分类", fig_title="HMDB chemical class enrichment",
+            p_cut=p_cut, file_stem="hmdb-class")
     classes, basis = _class_membership(ctx, notes)
     membership = {feature: {label} for feature, label in classes.items() if label}
     sig_features = sig["feature"].astype(str).tolist()

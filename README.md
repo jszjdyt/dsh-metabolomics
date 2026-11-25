@@ -44,7 +44,15 @@ python3 -c "import numpy,pandas,scipy,sklearn,matplotlib,statsmodels,openpyxl,li
 
 ## 说明与边界
 
-- 本机没有 xcms/ropls/MetaboAnalystR/pyopenms/matchms，**所有多变量/富集/鉴定都是内置实现**（numpy/scipy/sklearn），依据写在每个分析的「方法」列（Wold 1995 VIP；Trygg & Wold 2002 OPLS；Westerhuis 2008 置换；Dieterle 2006 PQN；van den Berg 2006 标度；Dunn 2011 QC-RLSC；Johnson 2007 ComBat；Li 2013 mummichog；Subramanian 2005 GSEA；Breiman 2001 RF；Tibshirani 1996 LASSO；DeLong 1988；Harrell 1996；Stein 1994 谱库匹配；Wang 2016 分子网络）。
-- Mummichog 式富集用内置通路-质量表 + 置换，**不做**真正的代谢网络传播；分子式候选只做质量/规则过滤，不等于结构鉴定。
-- 特征注释依赖你表里的 `mz/rt/kegg/class` 列或内置词典；没有 m/z 时鉴定类分析不可用。
-- 图内文字英文，中文说明在结果摘要里。
+**计算实现（2026-11 更新：已装真包，默认走主流实现）**
+
+- **PLS-DA / OPLS-DA → R `ropls` 1.47.0**（真包装在 R 4.4.2 库里；`method` 写 `ropls::opls（OPLS-DA，predI=1，orthoI=2，ropls 1.47.0）`）。
+  demo 实测：PLS-DA R²Y=0.989 / Q²=0.554；OPLS-DA R²Y=1.000 / **Q²=0.915**，置换 p=0.02，CV 准确率 0.833，VIP 前 20 命中注入特征 18–20/20。
+  PCA 也走 `ropls::opls`（PCA 模式）。
+- **MS2 库匹配 / 分子网络 → `matchms` 1.0.0**（`CosineGreedy`，前体 ±ppm + 峰容差），`method` 写 `matchms.similarity.CosineGreedy(...)`。
+- Python 侧环境 `~/.dsh/runtimes/bio312`（3.12）：matchms、rdkit、scanpy、lifelines、statsmodels 等。
+- **ropls 安装说明**：`bioconductor.org` 与国内镜像在本机不可达，ropls 是从 `git.bioconductor.org` 源码装的（只去掉了 `MultiAssayExperiment`/`MultiDataSet` 两个**对象互操作**依赖，PCA/PLS/OPLS 核心算法未改）。详见 INSTALL.md。
+- **仍是内置实现（已如实标注）**：加合物推断、分子式候选（CHNOPS + RDBE/七黄金规则，matchms/ropls 无此功能）；Mummichog 式通路富集（内置通路-质量表 + 置换，无 pip 版 mummichog）；QC-RLSC（Dunn 2011 自实现）；共表达网络/模块；DeLong CI；4PL 剂量响应。
+- `ropls`/`matchms` 不在时自动回退内置实现，`method` 标"回退内置 NIPALS/内置余弦"并给原因。
+- MetaboLights 检索按 12s 预算并发预取前几条元信息（EBI 端点 3–15s 抖动），其余点开详情再取。
+- 图内文字英文 + 中文回落字体。

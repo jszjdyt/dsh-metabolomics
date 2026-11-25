@@ -4526,13 +4526,14 @@
           setSearch({
             busy: false,
             error: '',
+            notes: Array.isArray(raw.notes) ? raw.notes.filter(function (note) { return plainText(note) }) : [],
             total: asNumber(raw.total) === null ? items.length : asNumber(raw.total),
             items: items,
             relaxed: plainText(raw.relaxed || raw.used_term || ''),
             usedTerm: plainText(raw.used_term || ''),
           })
         }).catch(function (error) {
-          setSearch({ busy: false, error: formatError(error), total: 0, items: [], relaxed: '', usedTerm: '' })
+          setSearch({ busy: false, error: formatError(error), total: 0, items: [], notes: [], relaxed: '', usedTerm: '' })
         })
       }
 
@@ -4707,6 +4708,10 @@
                 h('span', { className: 'mb-muted' }, T('geoHint')))
             : h('div', { className: 'mb-geo-filters' }, h('span', { className: 'mb-muted' }, T('mlHint'))),
           search.error ? h(InlineError, { message: search.error }) : null,
+          (search.notes && search.notes.length)
+            ? h('div', { className: 'mb-muted', style: { marginTop: '6px' } },
+                search.notes.map(function (note, index) { return h('div', { key: 'gn' + index }, '· ' + note) }))
+            : null,
           h('div', { className: 'mb-geo-layout' },
             h('div', { className: 'mb-geo-list' },
               search.total

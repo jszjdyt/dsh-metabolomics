@@ -1359,57 +1359,155 @@ def step_normalize(ctx, params, outdir):
 # ---------------------------------------------------------------------------
 
 
-def _transform_values(X: np.ndarray, transform: str) -> tuple[np.ndarray, str]:
-    """log2 / log10 / cuberoot；对 ≤0 的值加半个最小正值（保证有定义）。"""
+#: P0-1 三层（linear / log / model）默认内存预算：float32 × n × p × 3 层。
+#: 超预算时不伪造，按 model → linear → log 的优先级尽量保存，budget.truncated=True。
+LAYER_BUDGET_BYTES = 512 * 1024 * 1024
+
+_LOG_METHODS = ("log2", "log10", "ln")
+_LOG_BASE = {"log2": 2.0, "log10": 10.0, "ln": float(math.e)}
+
+
+def _transform_values(X: np.ndarray, transform: str) -> tuple[np.ndarray, str, dict]:
+    """log2 / log10 / ln / cuberoot；对 ≤0 的值加半个最小正值（保证有定义）。
+
+    返回 (变换后矩阵, 人类可读标签, 规格 dict)。规格 dict 是 P0-1 三层分离的元数据：
+    ``method``（none/log2/log10/ln/cuberoot）、``offset``、``base``、``label``。
+    """
     arr = np.asarray(X, dtype=np.float64)
-    if transform in ("none", "no", ""):
-        return arr.copy(), "none"
+    lowered = str(transform or "none").strip().lower()
+    if lowered in ("none", "no", ""):
+        return arr.copy(), "none", {"method": "none", "offset": 0.0, "base": None, "label": "none"}
     positive = arr[np.isfinite(arr) & (arr > 0)]
     offset = 0.0
-    if positive.size and np.nanmin(arr[np.isfinite(arr)]) <= 0:
+    finite = arr[np.isfinite(arr)]
+    if positive.size and finite.size and float(np.nanmin(finite)) <= 0:
         offset = float(positive.min()) / 2.0
     shifted = arr + offset
     with np.errstate(invalid="ignore", divide="ignore"):
-        if transform == "log2":
+        if lowered == "log2":
             out = np.log2(np.where(shifted > 0, shifted, np.nan))
-        elif transform == "log10":
+            method = "log2"
+        elif lowered == "log10":
             out = np.log10(np.where(shifted > 0, shifted, np.nan))
-        elif transform in ("cuberoot", "cbrt", "cube_root"):
+            method = "log10"
+        elif lowered in ("cuberoot", "cbrt", "cube_root"):
             out = np.cbrt(arr)
-        elif transform in ("log", "ln", "loge"):
+            method = "cuberoot"
+        elif lowered in ("log", "ln", "loge"):
             out = np.log(np.where(shifted > 0, shifted, np.nan))
+            method = "ln"
         else:
             raise bad_request(f"不支持的变换：{transform}（可选 log2 / log10 / cuberoot / none）")
     label = transform if offset == 0 else f"{transform}(x+{_fmt(offset, 3)})"
-    return out, label
+    meta = {"method": method, "offset": float(offset), "base": _LOG_BASE.get(method), "label": label}
+    return out, label, meta
 
 
-def _scale_values(X: np.ndarray, scale: str) -> tuple[np.ndarray, str]:
-    """auto(UV) / pareto / range / none 标度（van den Berg 2006）。"""
+def _scale_values(X: np.ndarray, scale: str) -> tuple[np.ndarray, str, dict]:
+    """auto(UV) / pareto / range / none 标度（van den Berg 2006）。
+
+    返回 (标度后矩阵, 标签, 规格 dict)。规格里的 ``center`` / ``denom`` 逐特征保存
+    "x → (x − center) / denom" 的实际参数（长度 = 特征数），供 P0-1 三层审计与反演。
+    """
     arr = np.asarray(X, dtype=np.float64)
     lowered = str(scale or "none").strip().lower()
+    n_features = int(arr.shape[1]) if arr.ndim == 2 else 0
     if lowered in ("none", "no", ""):
-        return arr.copy(), "none"
+        return (arr.copy(), "none",
+                {"method": "none", "chosen": "none", "label": "none",
+                 "center": np.zeros(n_features, dtype=np.float64),
+                 "denom": np.ones(n_features, dtype=np.float64)})
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         center = np.nanmean(arr, axis=0)
         sd = np.nanstd(arr, axis=0, ddof=1)
+    center = np.where(np.isfinite(center), center, 0.0)
     sd = np.where(np.isfinite(sd) & (sd > 0), sd, np.nan)
     if lowered in ("auto", "uv", "unit", "unit_variance", "autoscaling"):
         denom = np.where(np.isfinite(sd), sd, 1.0)
-        return (arr - center) / denom, "auto(UV, mean-center + /SD)"
-    if lowered in ("pareto", "par"):
+        label = "auto(UV, mean-center + /SD)"
+        method = "uv"
+    elif lowered in ("pareto", "par"):
         denom = np.where(np.isfinite(sd), np.sqrt(sd), 1.0)
-        return (arr - center) / denom, "pareto (mean-center + /sqrt(SD))"
-    if lowered in ("range", "rangescaling"):
+        label = "pareto (mean-center + /sqrt(SD))"
+        method = "pareto"
+    elif lowered in ("range", "rangescaling"):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             lo = np.nanmin(arr, axis=0)
             hi = np.nanmax(arr, axis=0)
         span = hi - lo
         denom = np.where(np.isfinite(span) & (span > 0), span, 1.0)
-        return (arr - center) / denom, "range (mean-center + /(max-min))"
-    raise bad_request(f"不支持的标度：{scale}（可选 auto / pareto / range / none）")
+        label = "range (mean-center + /(max-min))"
+        method = "range"
+    else:
+        raise bad_request(f"不支持的标度：{scale}（可选 auto / pareto / range / none）")
+    meta = {"method": method, "chosen": lowered, "label": label,
+            "center": center, "denom": np.asarray(denom, dtype=np.float64)}
+    return (arr - center) / denom, label, meta
+
+
+def _build_transform_layers(linear: np.ndarray, transformed: np.ndarray, model: np.ndarray,
+                            transform_meta: dict, scale_meta: dict, value_kind: str,
+                            ctx, params: dict) -> tuple[dict, list[str]]:
+    """P0-1：把 linear（归一化后原始强度）/ log（未标度变换层）/ model（建模标度层）三层
+    连同 features/samples 快照、变换/标度参数与数组预算写进 store["transform"]["layers"]。
+
+    预算：三层 float32 超过 ``LAYER_BUDGET_BYTES``（可用参数 layer_budget_bytes 覆盖）时，
+    按 model → linear → log 的优先级尽量保存数组，未保存的层为 None，并置 truncated=True
+    与 warning；绝不把不同层静默混用。
+    """
+    warnings_out: list[str] = []
+    n, p = np.asarray(model).shape
+    raw_limit = params.get("layer_budget_bytes") if isinstance(params, dict) else None
+    try:
+        limit = int(raw_limit) if raw_limit is not None else int(LAYER_BUDGET_BYTES)
+    except (TypeError, ValueError):
+        limit = int(LAYER_BUDGET_BYTES)
+    limit = max(1024, limit)
+    per_layer = max(1, limit // 3)
+    bytes_one = int(n) * int(p) * 4  # float32
+
+    arrays = {"linear": np.asarray(linear, dtype=np.float64),
+              "log": np.asarray(transformed, dtype=np.float64),
+              "model": np.asarray(model, dtype=np.float64)}
+    values: dict[str, np.ndarray | None] = {"linear": None, "log": None, "model": None}
+    stored: list[str] = []
+    if bytes_one <= per_layer:
+        for key in ("linear", "log", "model"):
+            values[key] = np.asarray(arrays[key], dtype=np.float32)
+            stored.append(key)
+        truncated = False
+    else:
+        budget = limit
+        for key in ("model", "linear", "log"):  # model 优先：后续分析/反演都先看它
+            if bytes_one <= budget:
+                values[key] = np.asarray(arrays[key], dtype=np.float32)
+                stored.append(key)
+                budget -= bytes_one
+        truncated = True
+        warnings_out.append(
+            f"矩阵 {n}×{p}（每层约 {bytes_one / 1048576:.1f} MB）超出三层数组预算 "
+            f"{limit / 1048576:.0f} MB，只保存了 {('/'.join(stored)) or '无'} 层；"
+            f"其余层为 None（不是空值伪造），需要现算请重跑「变换/标度」")
+
+    center = np.asarray(scale_meta.get("center", np.zeros(p)), dtype=np.float64)
+    denom = np.asarray(scale_meta.get("denom", np.ones(p)), dtype=np.float64)
+    layers = {
+        "schema": "mb-transform-layers/1",
+        "features": [str(f) for f in (ctx.get("features") or [])],
+        "samples": [str(s) for s in (ctx.get("samples") or [])],
+        "value_kind": str(value_kind or "raw"),
+        "transform": dict(transform_meta),
+        "scale": {k: v for k, v in dict(scale_meta).items() if k not in ("center", "denom")},
+        "center": np.asarray(center, dtype=np.float32),
+        "denom": np.asarray(denom, dtype=np.float32),
+        "values": values,
+        "stored": stored,
+        "budget": {"limit_bytes": int(limit), "per_layer_bytes": int(per_layer),
+                   "truncated": bool(truncated)},
+    }
+    return layers, warnings_out
 
 
 def step_transform(ctx, params, outdir):
@@ -1421,7 +1519,7 @@ def step_transform(ctx, params, outdir):
     current_kind = str((ctx or {}).get("X_kind") or "raw")
 
     skew_before, kurt_before = _skew_kurt(X)
-    Xt, transform_label = _transform_values(X, transform)
+    Xt, transform_label, transform_meta = _transform_values(X, transform)
     skew_mid, kurt_mid = _skew_kurt(Xt)
     finite_skew = skew_mid[np.isfinite(skew_mid)]
     median_abs_skew = float(np.median(np.abs(finite_skew))) if finite_skew.size else 0.0
@@ -1432,7 +1530,7 @@ def step_transform(ctx, params, outdir):
         chosen_scale = "pareto" if median_abs_skew > 1.0 else "auto"
         auto_note = (f"auto 标度：变换后 |偏度| 中位 {median_abs_skew:.2f} "
                      f"{'> 1 → pareto' if median_abs_skew > 1.0 else '≤ 1 → UV'}")
-    Xs, scale_label = _scale_values(Xt, chosen_scale)
+    Xs, scale_label, scale_meta = _scale_values(Xt, chosen_scale)
     skew_after, kurt_after = _skew_kurt(Xs)
 
     if not np.all(np.isfinite(Xs)):
@@ -1467,11 +1565,22 @@ def step_transform(ctx, params, outdir):
     except Exception:  # noqa: BLE001
         pass
 
-    applied = (transform not in ("none", "no", "")) or (scale_label != "none")
-    kind = "scaled" if applied else current_kind
+    # X_kind 三值语义：有标度→scaled；仅 log→lognorm；仅 cuberoot→transformed
+    _t = str(transform or "").strip().lower()
+    _did_transform = _t not in ("none", "no", "")
+    _did_scale = str(scale_label or "none").strip().lower() != "none"
+    applied = _did_transform or _did_scale
+    if _did_scale:
+        kind = "scaled"
+    elif _t in ("log2", "log10", "ln", "log", "log1p"):
+        kind = "lognorm"
+    elif _t in ("cuberoot", "cbrt"):
+        kind = "transformed"
+    else:
+        kind = current_kind
     replace = {"X": np.asarray(Xs, dtype=np.float32)}
     if applied:
-        replace["X_kind"] = "scaled"
+        replace["X_kind"] = kind
     warnings_list = []
     if not applied:
         warnings_list.append("变换与标度都设为 none：X_kind 保持原值")
@@ -1486,18 +1595,43 @@ def step_transform(ctx, params, outdir):
         + (f"；{auto_note}" if auto_note else ""),
         f"特征 |偏度| 中位：{rows[0]['median_abs_skew']:.2f} → {rows[2]['median_abs_skew']:.2f}"
         f"（超峰度中位 {rows[2]['median_kurtosis']:.2f}）",
-        "输出 X_kind = scaled：后续 PCA/PLS-DA 在标度后的矩阵上计算",
+        {"scaled": "输出 X_kind = scaled：后续 PCA/PLS-DA 在标度后的矩阵上计算",
+         "lognorm": "输出 X_kind = lognorm：只做了对数变换、未标度；PCA 等多元分析前建议再跑一次标度",
+         "transformed": "输出 X_kind = transformed：只做了 cuberoot、未标度；PCA 等多元分析前建议再跑一次标度",
+         }.get(str(kind), f"未做变换/标度：X_kind 保持 {current_kind}（下一步 PCA 会拒绝 raw 矩阵）"),
     ]
     if transform in ("none", "no", "") and scale == "none":
         bullets.append("注意：未做任何变换/标度，PCA 可能被少数高丰度特征主导")
 
+    # P0-1：三层分离 —— linear（归一化后原始强度）/ log（未标度变换层）/ model（建模标度层）
+    # 三层 + 快照 + 变换/标度参数 + 数组预算一起进 store["transform"]["layers"]，供 mb_de 等
+    # 下游按"效应量用未标度层、统计量用当前矩阵"的口径取数（BIO_P0_BACKLOG §4 P0-1）。
+    layer_warnings: list[str] = []
+    try:
+        layers, layer_warnings = _build_transform_layers(
+            np.asarray(X, dtype=np.float64), np.asarray(Xt, dtype=np.float64),
+            np.asarray(Xs, dtype=np.float64), transform_meta, scale_meta, kind, ctx or {}, params)
+    except Exception as error:  # noqa: BLE001 - 层快照失败不阻塞主步骤，但必须明说
+        layers = None
+        layer_warnings = [f"三层快照保存失败（{type(error).__name__}: {error}），下游将回退当前矩阵口径"]
+    warnings_list.extend(layer_warnings)
+
+    store_transform = {
+        "transform": transform_label,
+        "scale": scale_label,
+        "median_abs_skew_before": rows[0]["median_abs_skew"],
+        "median_abs_skew_after": rows[2]["median_abs_skew"],
+        "layers": layers,
+    }
     return result(
         title="变换/标度",
         bullets=bullets,
         metrics={"transform": transform_label, "scale": scale_label,
                  "median_abs_skew_before": rows[0]["median_abs_skew"],
                  "median_abs_skew_after": rows[2]["median_abs_skew"],
-                 "X_kind": kind},
+                 "X_kind": kind,
+                 "layers_stored": list((layers or {}).get("stored") or []),
+                 "layers_truncated": bool(((layers or {}).get("budget") or {}).get("truncated"))},
         tables=[table("transform", "偏度 / 峰度前后对比",
                       columns=[{"key": "stage", "label": "阶段", "type": "string"},
                                {"key": "median_abs_skew", "label": "|偏度| 中位", "type": "number"},
@@ -1506,9 +1640,7 @@ def step_transform(ctx, params, outdir):
                       note="偏度/超峰度逐特征计算（Fisher）；接近 0 表示分布更对称、更接近高斯")],
         figures=figures,
         replace=replace,
-        store={"transform": {"transform": transform_label, "scale": scale_label,
-                             "median_abs_skew_before": rows[0]["median_abs_skew"],
-                             "median_abs_skew_after": rows[2]["median_abs_skew"]}},
+        store={"transform": store_transform},
         warnings=warnings_list,
     )
 

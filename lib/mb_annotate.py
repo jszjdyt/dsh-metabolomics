@@ -1,18 +1,24 @@
 """
 dsh-metabolomics — 代谢物鉴定（DESIGN.md §3 `annotate` + §4 group=代谢物鉴定）
 
-方法（文献）：
-  * 加合物推断：按常见加合物质量差在特征间配对，反推中性质量（MS-DIAL / CAMERA 思路）。
+方法（文献 / 真实实现）：
+  * 加合物推断：按常见加合物质量差在特征间配对，反推中性质量（MS-DIAL / CAMERA 思路；内置实现）。
   * 分子式候选：CHNOPS 组合枚举 + 质量精度 ppm + RDBE 与七黄金规则过滤
-    （Kind & Fiehn 2007 "Seven Golden Rules"）。
-  * MS2 库匹配：余弦相似度（Stein 1994）+ 前体 m/z 容差；库来自 msp/mgf（mb_io 解析）或本模块内置解析。
-  * 分子网络：余弦相似度网络 + 连通分量（GNPS 分子网络思路，Wang 2016）。
+    （Kind & Fiehn 2007 "Seven Golden Rules"；内置实现）。
+  * MS2 库匹配：余弦相似度 + 前体 m/z 容差；**优先用 matchms 官方实现**
+    （matchms.importing.load_from_msp / load_from_mgf 解析谱库，
+    matchms.similarity.CosineGreedy 计分，matchms.filtering.default_filters 清洗峰），
+    matchms 不可用时回退本模块内置余弦（Stein 1994 语义）。method 字段写明走哪条路。
+  * 分子网络：余弦相似度网络 + 连通分量（GNPS 分子网络思路，Wang 2016）；
+    余弦同样优先走 matchms CosineGreedy 矩阵，不可用时回退内置实现。
 """
 
 from __future__ import annotations
 
 import math
 import os
+import threading
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -104,10 +110,65 @@ def _spectra(ctx, params) -> list[dict]:
 
 
 def _parse_spectra_file(path: str) -> list[dict]:
-    """极简 msp/mgf 解析（mb_io 未就绪或直接给路径时用）。"""
+    """msp/mgf 谱库 → 统一 spectrum dict。
+
+    优先用 matchms 官方解析器（load_from_msp / load_from_mgf，含元数据调和），
+    解析不出东西或 matchms 不可用时回退本模块内置解析。
+    """
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.exists(path):
         raise sc.prerequisite(f"谱库文件不存在：{path}")
+    state = _matchms_or_none()
+    if state:
+        spectra = _parse_spectra_matchms(state, path)
+        if spectra:
+            return spectra
+    return _parse_spectra_builtin(path)
+
+
+def _parse_spectra_matchms(state: dict, path: str) -> list[dict]:
+    """matchms.importing.load_from_msp / load_from_mgf → 统一 spectrum dict（失败返回 []）。"""
+    lowered = path.lower()
+    if lowered.endswith(".msp"):
+        loader = state.get("load_from_msp")
+    elif lowered.endswith(".mgf"):
+        loader = state.get("load_from_mgf")
+    else:
+        loader = None
+    if loader is None:
+        return []
+    spectra: list[dict] = []
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for index, spectrum in enumerate(loader(path)):
+                arrays = (np.asarray(spectrum.peaks.mz, dtype=float),
+                          np.asarray(spectrum.peaks.intensities, dtype=float))
+                if arrays[0].size == 0:
+                    continue
+                metadata = dict(getattr(spectrum, "metadata", {}) or {})
+                precursor = metadata.get("precursor_mz")
+                try:
+                    precursor = float(precursor) if precursor is not None else None
+                except (TypeError, ValueError):
+                    precursor = None
+                spectra.append({
+                    "id": str(metadata.get("compound_name") or metadata.get("name")
+                              or f"ms{index + 1}"),
+                    "precursor_mz": precursor,
+                    "peaks": [[float(mz), float(intensity)]
+                              for mz, intensity in zip(arrays[0], arrays[1])],
+                    "formula": metadata.get("formula"),
+                    "inchikey": metadata.get("inchikey"),
+                    "adduct": metadata.get("adduct") or metadata.get("ionmode"),
+                })
+    except Exception:  # noqa: BLE001 - 解析失败走内置解析
+        return []
+    return spectra
+
+
+def _parse_spectra_builtin(path: str) -> list[dict]:
+    """极简 msp/mgf 解析（matchms 不可用时的回退）。"""
     text = open(path, "r", encoding="utf-8", errors="replace").read()
     spectra: list[dict] = []
     if path.lower().endswith(".mgf"):
@@ -216,6 +277,211 @@ def _cosine(a: dict, b: dict, tolerance: float = 0.02) -> float:
             num += value * b[best_key]
     denom = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
     return float(num / denom) if denom > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# matchms 官方实现（MS2 相似度 / 谱库解析的优先路径）
+# ---------------------------------------------------------------------------
+
+MS2_TOLERANCE = 0.02       # CosineGreedy 峰匹配容差（Da，默认；可用 params.tolerance 覆盖）
+
+_MATCHMS_LOCK = threading.Lock()
+_MATCHMS_STATE: dict = {
+    "checked": False,
+    "ok": False,
+    "version": None,
+    "error": None,
+    "spectrum": None,
+    "cosine_greedy": None,
+    "load_from_msp": None,
+    "load_from_mgf": None,
+    "default_filters": None,
+}
+
+
+def matchms_status() -> dict:
+    """惰性探测 matchms（缺包/版本不兼容只记录原因，不抛异常）。"""
+    with _MATCHMS_LOCK:
+        if _MATCHMS_STATE.get("checked"):
+            return dict(_MATCHMS_STATE)
+        state: dict = {"checked": True, "ok": False, "version": None, "error": None,
+                       "spectrum": None, "cosine_greedy": None, "load_from_msp": None,
+                       "load_from_mgf": None, "default_filters": None}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                import matchms  # noqa: PLC0415 - 惰性 import：只在 MS2 分析时需要
+                from matchms import Spectrum  # noqa: PLC0415
+                from matchms.filtering import default_filters  # noqa: PLC0415
+                from matchms.importing import load_from_mgf, load_from_msp  # noqa: PLC0415
+                from matchms.similarity import CosineGreedy  # noqa: PLC0415
+            state.update({
+                "ok": True,
+                "version": str(getattr(matchms, "__version__", "") or ""),
+                "spectrum": Spectrum,
+                "cosine_greedy": CosineGreedy,
+                "load_from_msp": load_from_msp,
+                "load_from_mgf": load_from_mgf,
+                "default_filters": default_filters,
+            })
+        except Exception as error:  # noqa: BLE001 - 缺包/ABI 不兼容都走内置回退
+            state["error"] = f"{type(error).__name__}: {error}"
+        _MATCHMS_STATE.update(state)
+        return dict(_MATCHMS_STATE)
+
+
+def _matchms_or_none() -> dict | None:
+    state = matchms_status()
+    return state if state.get("ok") else None
+
+
+def _peaks_arrays(peaks):
+    """峰表 → (mz 升序数组, 强度数组)；无效峰丢弃。"""
+    mz: list[float] = []
+    intensity: list[float] = []
+    for peak in peaks or []:
+        try:
+            value_mz, value_intensity = float(peak[0]), float(peak[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not np.isfinite(value_mz) or not np.isfinite(value_intensity) or value_intensity <= 0:
+            continue
+        mz.append(value_mz)
+        intensity.append(value_intensity)
+    if not mz:
+        return None
+    order = np.argsort(np.asarray(mz, dtype=float))
+    return np.asarray(mz, dtype=float)[order], np.asarray(intensity, dtype=float)[order]
+
+
+def _matchms_spectrum(state: dict, peaks, precursor_mz=None, name=None):
+    """峰表 → matchms Spectrum（并过一遍 matchms.filtering.default_filters）。"""
+    arrays = _peaks_arrays(peaks)
+    if arrays is None:
+        return None
+    mz, intensity = arrays
+    metadata: dict = {}
+    try:
+        if precursor_mz is not None and np.isfinite(float(precursor_mz)):
+            metadata["precursor_mz"] = float(precursor_mz)
+    except (TypeError, ValueError):
+        pass
+    if name:
+        metadata["compound_name"] = str(name)
+    try:
+        spectrum = state["spectrum"](mz=mz, intensities=intensity, metadata=metadata)
+    except Exception:  # noqa: BLE001 - 单张谱失败不影响其它谱
+        return None
+    try:
+        filtered = state["default_filters"](spectrum)
+        if filtered is not None and len(filtered.peaks.mz):
+            spectrum = filtered
+    except Exception:  # noqa: BLE001 - 清洗失败就用原谱
+        pass
+    return spectrum
+
+
+def _matchms_greedy(state: dict, tolerance: float):
+    """CosineGreedy 实例（不裁噪、不去前体：峰匹配只由 tolerance 决定，便于与内置实现对照）。"""
+    try:
+        return state["cosine_greedy"](tolerance=float(tolerance), noise_cutoff=0.0,
+                                      remove_precursor=False, mz_power=0.0,
+                                      intensity_power=1.0)
+    except TypeError:  # 老版本 matchms 没有这些关键字
+        return state["cosine_greedy"](tolerance=float(tolerance))
+
+
+def _matchms_score(state: dict, greedy, spectrum_a, spectrum_b) -> float:
+    """两张 matchms Spectrum 的 CosineGreedy 得分（0..1）。"""
+    if spectrum_a is None or spectrum_b is None:
+        return 0.0
+    try:
+        value = greedy.pair(spectrum_a, spectrum_b)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    score = 0.0
+    try:
+        score = float(np.asarray(value)["score"])
+    except Exception:  # noqa: BLE001
+        try:
+            score = float(value[0])
+        except Exception:  # noqa: BLE001
+            score = 0.0
+    return float(score) if np.isfinite(score) else 0.0
+
+
+def _matchms_matrix(state: dict, greedy, spectra: list) -> np.ndarray:
+    """余弦矩阵（CosineGreedy.matrix，失败则逐对 pair 回退）。"""
+    n = len(spectra)
+    out = np.zeros((n, n), dtype=float)
+    if n == 0:
+        return out
+    try:
+        scores = greedy.matrix(spectra, progress_bar=False)
+        array = scores.to_array()
+        values = np.asarray(array["score"], dtype=float)
+        if values.shape == (n, n):
+            return np.nan_to_num(values, nan=0.0)
+    except Exception:  # noqa: BLE001 - 矩阵接口失败就逐对算
+        pass
+    for i in range(n):
+        for j in range(i + 1, n):
+            value = _matchms_score(state, greedy, spectra[i], spectra[j])
+            out[i, j] = value
+            out[j, i] = value
+    return out
+
+
+def _feature_spectra_map(names: list[str], spectra: list[dict]) -> dict:
+    """特征自己的实验 MS2 谱：谱图带 feature 关联字段，或 id/name 与特征同名。
+
+    demo 谱库里与特征 m/z 精确对应的那批谱就带 `feature` 字段——它们既是库谱，也是
+    该特征的实验谱，所以自匹配得分应 ≈1（DESIGN §9 验收点）。
+    """
+    name_set = {str(name) for name in names}
+    mapping: dict = {}
+    for spectrum in spectra:
+        if not spectrum.get("peaks"):
+            continue
+        reference = ""
+        for key in ("feature", "feature_id", "featureid"):
+            value = spectrum.get(key)
+            if value:
+                reference = str(value)
+                break
+        if not reference:
+            for key in ("id", "name"):
+                value = spectrum.get(key)
+                if value is not None and str(value) in name_set:
+                    reference = str(value)
+                    break
+        if reference in name_set:
+            mapping[reference] = spectrum
+    return mapping
+
+
+def _method_ms2(state: dict | None, kind: str, ppm=None, tolerance=None) -> str:
+    """MS2 分析的真实实现字符串（供 summary.method 使用）。"""
+    if state:
+        version = str(state.get("version") or "").strip()
+        version_txt = f"matchms {version}" if version else "matchms"
+        if kind == "library":
+            return (f"matchms.similarity.CosineGreedy（前体 ±{ppm} ppm，"
+                    f"峰容差 {tolerance} Da；{version_txt}）")
+        return (f"matchms.similarity.CosineGreedy 余弦矩阵（峰容差 {tolerance} Da）"
+                f"+ 连通分量（GNPS 思路；{version_txt}）")
+    reason = matchms_status().get("error") or "未检测到 matchms"
+    if kind == "library":
+        return f"内置余弦实现（matchms 不可用：{reason}）"
+    return f"内置余弦矩阵 + 连通分量（matchms 不可用：{reason}）"
+
+
+def _finish(payload: dict, method: str) -> dict:
+    """把真实实现写进结果信封（summary.method）。"""
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary["method"] = str(method)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -393,11 +659,14 @@ def step_annotate(ctx, params, outdir):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     figures.append(sc.save_fig(fig, outdir, "mz-distribution", title=None))
-    bullets = [f"{len(rows)} 个带 m/z 的特征（极性 {polarity}），按 {adducts[0]} 反推中性质量",
+    method = "特征中性质量推断（按默认加合物的质量差；内置实现）"
+    bullets = [f"实现：{method}",
+               f"{len(rows)} 个带 m/z 的特征（极性 {polarity}），按 {adducts[0]} 反推中性质量",
                "下一步可跑「加合物推断」「分子式候选」或导入 MS2 库做匹配"]
     result = sc.result(
         summary={"title": "代谢物鉴定（准备）", "bullets": bullets,
-                 "metrics": {"n_features": len(rows), "polarity": polarity, "ppm": ppm}},
+                 "metrics": {"n_features": len(rows), "polarity": polarity, "ppm": ppm,
+                             "implementation": method}},
         tables=[sc.table("annotate", "特征的中性质量推断",
                          columns=[{"key": "feature", "label": "特征", "type": "string"},
                                   {"key": "mz", "label": "m/z", "type": "number"},
@@ -407,9 +676,10 @@ def step_annotate(ctx, params, outdir):
                          rows=table_rows,
                          note=f"按 {adducts[0]} 反推；多加合物需跑「加合物推断」")],
         figures=figures,
-        store={"annotation": {"polarity": polarity, "ppm": ppm, "n_features": len(rows)}},
+        store={"annotation": {"polarity": polarity, "ppm": ppm, "n_features": len(rows),
+                              "implementation": method}},
     )
-    return result
+    return _finish(result, method)
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +710,12 @@ def analysis_adduct_annot(ctx, params, outdir):
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
         figures.append(sc.save_fig(fig, outdir, "adduct-pairs", title=None))
-    return sc.result(
+    method = "特征间加合物质量差配对（MS-DIAL / CAMERA 思路；内置实现）"
+    bullets = [f"实现：{method}"] + bullets
+    payload = sc.result(
         summary={"title": "加合物推断", "bullets": bullets,
-                 "metrics": {"n_pairs": len(pairs), "ppm": ppm, "polarity": polarity}},
+                 "metrics": {"n_pairs": len(pairs), "ppm": ppm, "polarity": polarity,
+                             "implementation": method}},
         tables=[sc.table("adducts", "加合物配对（同一中性质量）",
                          columns=[{"key": "feature_a", "label": "特征 A", "type": "number"},
                                   {"key": "adduct_a", "label": "加合物 A", "type": "string"},
@@ -454,8 +727,10 @@ def analysis_adduct_annot(ctx, params, outdir):
                                   {"key": "rt_b", "label": "RT B", "type": "number"}],
                          rows=pairs)],
         figures=figures,
-        store={"adducts": {"n_pairs": len(pairs), "pairs": pairs[:2000]}},
+        store={"adducts": {"n_pairs": len(pairs), "pairs": pairs[:2000],
+                           "implementation": method}},
     )
+    return _finish(payload, method)
 
 
 def analysis_formula_candidates(ctx, params, outdir):
@@ -497,9 +772,12 @@ def analysis_formula_candidates(ctx, params, outdir):
     figure = sc.save_fig(fig, outdir, "formula-accuracy", title=None)
     bullets = [f"{len(targets)} 个特征共 {len(frame)} 个候选分子式（ppm≤{ppm}，RDBE 与七黄金规则过滤）",
                "误差最小的候选：" + "、".join(f"{row['formula']}({row['ppm']:+.2f}ppm)" for row in rows[:3])]
-    return sc.result(
+    method = "CHNOPS 枚举 + RDBE / 七黄金规则（Kind & Fiehn 2007；内置实现）"
+    bullets = [f"实现：{method}"] + bullets
+    payload = sc.result(
         summary={"title": "分子式候选", "bullets": bullets,
-                 "metrics": {"n_features": len(targets), "n_candidates": len(rows), "ppm": ppm}},
+                 "metrics": {"n_features": len(targets), "n_candidates": len(rows), "ppm": ppm,
+                             "implementation": method}},
         tables=[sc.table("formulas", "分子式候选",
                          columns=[{"key": "feature", "label": "特征", "type": "string"},
                                   {"key": "neutral_mass", "label": "中性质量", "type": "number"},
@@ -511,63 +789,57 @@ def analysis_formula_candidates(ctx, params, outdir):
         figures=[figure],
         store={"formulas": frame.head(2000)},
     )
-
-
-def _match_spectra(features_mz: np.ndarray, names: list[str], spectra: list[dict],
-                   ppm: float, min_score: float, top_n: int) -> list[dict]:
-    rows: list[dict] = []
-    for spectrum in spectra:
-        peaks = _norm_peaks(spectrum.get("peaks"))
-        if not peaks:
-            continue
-        precursor = spectrum.get("precursor_mz")
-        candidates = np.ones(len(names), dtype=bool)
-        if precursor is not None and np.isfinite(precursor):
-            err = np.abs(features_mz - float(precursor)) / max(float(precursor), 1e-9) * 1e6
-            candidates = err <= ppm
-            err_values = err
-        else:
-            err_values = np.full(len(names), np.nan)
-        for index in np.where(candidates)[0]:
-            if not np.isfinite(features_mz[index]):
-                continue
-            rows.append({"library_id": spectrum.get("id"),
-                         "feature": names[index],
-                         "precursor_mz": float(precursor) if precursor else None,
-                         "feature_mz": float(features_mz[index]),
-                         "ppm": float(err_values[index]) if np.isfinite(err_values[index]) else None,
-                         "score": 0.0, "library_formula": spectrum.get("formula"),
-                         "_peaks": peaks})
-    return rows
+    return _finish(payload, method)
 
 
 def analysis_ms2_library_match(ctx, params, outdir):
+    """MS2 库匹配：前体 m/z 容差筛候选 + 余弦打分。
+
+    余弦优先用 matchms 官方实现（CosineGreedy）；库谱解析优先用 matchms
+    load_from_msp/load_from_mgf。特征自己的实验 MS2 谱来自 library 里带 feature 关联的谱，
+    没有实验谱时只给前体候选（score=0 表示算不了相似度，不伪造分数）。
+    """
     mz, rt, names = _mz_rt(ctx)
     spectra = _spectra(ctx, params)
     ppm = _p_float(params, "ppm", 20.0)
     min_score = _p_float(params, "min_score", 0.5)
     top_n = _p_int(params, "top_n", 5)
-    # 特征谱库：若特征是"谱图型"（library 与特征同名），直接与库互比；否则仅按前体匹配给候选
-    feature_spectra = {}
-    library = ctx.get("library")
-    if isinstance(library, dict):
-        for spectrum in library.get("spectra") or []:
-            name = str(spectrum.get("id"))
-            if name in set(names):
-                feature_spectra[name] = _norm_peaks(spectrum.get("peaks"))
+    tolerance = _p_float(params, "tolerance", MS2_TOLERANCE)
+    state = _matchms_or_none()
+    greedy = _matchms_greedy(state, tolerance) if state else None
+    method = _method_ms2(state, "library", ppm=ppm, tolerance=tolerance)
+
+    queries = _feature_spectra_map(names, spectra)
+    query_spectra = {}
+    if state:
+        for feature, spectrum in queries.items():
+            query_spectra[feature] = _matchms_spectrum(
+                state, spectrum.get("peaks"), spectrum.get("precursor_mz"), spectrum.get("id"))
+
     rows: list[dict] = []
+    n_scored = 0
     for spectrum in spectra:
-        peaks = _norm_peaks(spectrum.get("peaks"))
+        peaks = spectrum.get("peaks")
         if not peaks:
             continue
         precursor = spectrum.get("precursor_mz")
         if precursor is None or not np.isfinite(float(precursor)):
             continue
+        library_spectrum = _matchms_spectrum(state, peaks, precursor,
+                                             spectrum.get("id")) if state else None
+        library_peaks = _norm_peaks(peaks) if not state else None
         err = np.abs(mz - float(precursor)) / max(float(precursor), 1e-9) * 1e6
         for index in np.where(err <= ppm)[0]:
             score = 0.0
-            if names[index] in feature_spectra:
-                score = _cosine(feature_spectra[names[index]], peaks)
+            reference = queries.get(names[index])
+            if reference is not None:
+                if state and library_spectrum is not None and query_spectra.get(names[index]) is not None:
+                    score = _matchms_score(state, greedy,
+                                           query_spectra[names[index]], library_spectrum)
+                    n_scored += 1
+                elif library_peaks:
+                    score = _cosine(_norm_peaks(reference.get("peaks")), library_peaks)
+                    n_scored += 1
             rows.append({"library_id": spectrum.get("id"), "feature": names[index],
                          "precursor_mz": float(precursor), "feature_mz": float(mz[index]),
                          "ppm": float(err[index]), "score": score,
@@ -588,16 +860,21 @@ def analysis_ms2_library_match(ctx, params, outdir):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     figure = sc.save_fig(fig, outdir, "ms2-match-scores", title=None)
-    bullets = [f"库谱 {len(spectra)} 张 vs 特征 {len(names)} 个：{len(frame)} 条候选（±{ppm}ppm）",
-               f"余弦 ≥{min_score} 的匹配：{len(matched)} 条"]
-    if len(feature_spectra):
-        bullets.append(f"其中 {len(feature_spectra)} 个特征自带实验谱，已计算真实余弦相似度")
+    bullets = [f"实现：{method}",
+               f"库谱 {len(spectra)} 张 vs 特征 {len(names)} 个：{len(frame)} 条候选（±{ppm}ppm）",
+               f"余弦 ≥{min_score} 的匹配：{len(matched)} 条（实际算了 {n_scored} 对余弦）"]
+    if len(queries):
+        top_score = float(frame["score"].max()) if len(frame) else 0.0
+        bullets.append(f"其中 {len(queries)} 个特征自带实验 MS2 谱；最高余弦 {top_score:.3f}"
+                       f"（同一张谱自匹配≈1，是链路自检点）")
     else:
         bullets.append("特征没有实验 MS2 谱：本次只按前体质量给出候选（score=0 表示无法算相似度）")
-    return sc.result(
+    payload = sc.result(
         summary={"title": "MS2 库匹配", "bullets": bullets,
                  "metrics": {"n_spectra": len(spectra), "n_candidates": len(frame),
-                             "n_matched": int(len(matched))}},
+                             "n_matched": int(len(matched)), "n_scored": n_scored,
+                             "n_query_spectra": len(queries),
+                             "implementation": method}},
         tables=[sc.table("ms2", "MS2 库匹配候选",
                          columns=[{"key": "feature", "label": "特征", "type": "string"},
                                   {"key": "library_id", "label": "库谱", "type": "string"},
@@ -610,26 +887,53 @@ def analysis_ms2_library_match(ctx, params, outdir):
         figures=[figure],
         store={"ms2_match": frame.head(2000)},
     )
+    return _finish(payload, method)
 
 
 def analysis_ms2_network(ctx, params, outdir):
+    """分子网络：余弦矩阵 + 阈值连边 + 连通分量（GNPS 思路，Wang 2016）。
+
+    余弦矩阵优先由 matchms.similarity.CosineGreedy 计算（matchms 不可用时回退内置余弦）。
+    """
     spectra = _spectra(ctx, params)
     min_score = _p_float(params, "min_score", 0.6)
     max_nodes = _p_int(params, "max_nodes", 200)
-    tolerance = _p_float(params, "tolerance", 0.02)
+    tolerance = _p_float(params, "tolerance", MS2_TOLERANCE)
     if len(spectra) < 3:
         raise sc.prerequisite("谱库少于 3 张谱，无法构建分子网络")
     spectra = spectra[:max_nodes]
-    normalised = [(str(s.get("id")), _norm_peaks(s.get("peaks")), s.get("precursor_mz")) for s in spectra]
+    state = _matchms_or_none()
+    greedy = _matchms_greedy(state, tolerance) if state else None
+    method = _method_ms2(state, "network", tolerance=tolerance)
+
+    normalised = [(str(s.get("id")), _norm_peaks(s.get("peaks")), s.get("precursor_mz"), s)
+                  for s in spectra]
     normalised = [item for item in normalised if item[1]]
     if len(normalised) < 3:
         raise sc.prerequisite("有效谱图少于 3 张")
-    edges = []
-    for i in range(len(normalised)):
-        for j in range(i + 1, len(normalised)):
-            score = _cosine(normalised[i][1], normalised[j][1], tolerance=tolerance)
-            if score >= min_score:
-                edges.append((i, j, score))
+
+    edges: list[tuple[int, int, float]] = []
+    if state:
+        matchms_spectra = [_matchms_spectrum(state, item[3].get("peaks"),
+                                             item[3].get("precursor_mz"), item[0])
+                           for item in normalised]
+        valid = [index for index, spectrum in enumerate(matchms_spectra) if spectrum is not None]
+        matrix = np.zeros((len(normalised), len(normalised)), dtype=float)
+        if valid:
+            sub = _matchms_matrix(state, greedy, [matchms_spectra[i] for i in valid])
+            for i_pos, i in enumerate(valid):
+                for j_pos, j in enumerate(valid):
+                    matrix[i, j] = sub[i_pos, j_pos]
+        for i in range(len(normalised)):
+            for j in range(i + 1, len(normalised)):
+                if matrix[i, j] >= min_score:
+                    edges.append((i, j, float(matrix[i, j])))
+    else:
+        for i in range(len(normalised)):
+            for j in range(i + 1, len(normalised)):
+                score = _cosine(normalised[i][1], normalised[j][1], tolerance=tolerance)
+                if score >= min_score:
+                    edges.append((i, j, score))
     # 连通分量
     parent = list(range(len(normalised)))
 
@@ -650,13 +954,12 @@ def analysis_ms2_network(ctx, params, outdir):
     for index in range(len(normalised)):
         components.setdefault(find(index), []).append(index)
     outdir = _outdir(ctx, outdir)
-    # 画网络（只用边 + 简单力导向：networkx spring_layout 可选）
     fig, ax = sc.new_fig(7.2, 6.0)
     try:
         import networkx as nx
 
         graph = nx.Graph()
-        for index, (name, _peaks, precursor) in enumerate(normalised):
+        for index, (name, _peaks, precursor, _raw) in enumerate(normalised):
             graph.add_node(index, label=name, mz=precursor)
         for i, j, score in edges:
             graph.add_edge(i, j, weight=score)
@@ -677,28 +980,36 @@ def analysis_ms2_network(ctx, params, outdir):
         ax.set_xticks([]); ax.set_yticks([])
         for side in ("top", "right", "left", "bottom"):
             ax.spines[side].set_visible(False)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - 没有 networkx 时退回余弦直方图
         ax.hist([e[2] for e in edges] or [0], bins=20, color=sc.PALETTE[0])
         ax.set_xlabel("cosine", fontsize=9); ax.set_ylabel("edges", fontsize=9)
-    ax.set_title(f"MS2 molecular network (cosine ≥ {min_score})", fontsize=10)
+    ax.set_title(f"MS2 molecular network (cosine >= {min_score})", fontsize=10)
     figure = sc.save_fig(fig, outdir, "ms2-network", title=None)
     rows = [{"spectrum_a": normalised[i][0], "spectrum_b": normalised[j][0], "cosine": float(score)}
             for i, j, score in edges]
     largest = max((len(v) for v in components.values()), default=0)
-    bullets = [f"{len(normalised)} 张谱、{len(edges)} 条边（余弦≥{min_score}），{len(components)} 个分子网络",
-               f"最大网络含 {largest} 张谱"]
-    return sc.result(
+    mean_score = float(np.mean([e[2] for e in edges])) if edges else 0.0
+    bullets = [f"实现：{method}",
+               f"{len(normalised)} 张谱、{len(edges)} 条边（余弦≥{min_score}），"
+               f"{len(components)} 个分子网络",
+               f"最大网络含 {largest} 张谱" + (f"；连边平均余弦 {mean_score:.3f}" if edges else
+                                               "；阈值内没有连边（可放宽 min_score 看相似度分布）")]
+    payload = sc.result(
         summary={"title": "分子网络", "bullets": bullets,
                  "metrics": {"n_spectra": len(normalised), "n_edges": len(edges),
-                             "n_components": len(components), "largest": int(largest)}},
+                             "n_components": len(components), "largest": int(largest),
+                             "mean_edge_cosine": mean_score,
+                             "tolerance": tolerance, "implementation": method}},
         tables=[sc.table("ms2_network", "谱间余弦边",
                          columns=[{"key": "spectrum_a", "label": "谱 A", "type": "string"},
                                   {"key": "spectrum_b", "label": "谱 B", "type": "string"},
                                   {"key": "cosine", "label": "余弦", "type": "number"}],
                          rows=rows)],
         figures=[figure],
-        store={"ms2_network": {"edges": rows[:2000], "n_components": len(components)}},
+        store={"ms2_network": {"edges": rows[:2000], "n_components": len(components),
+                               "implementation": method}},
     )
+    return _finish(payload, method)
 
 
 # ---------------------------------------------------------------------------
@@ -795,7 +1106,7 @@ ANALYSES = [
     },
     {
         "id": "ms2_library_match", "title": "MS2 库匹配", "group": "代谢物鉴定",
-        "method": "余弦相似度 + 前体容差（Stein 1994；MassBank/GNPS 语义）",
+        "method": "余弦相似度 + 前体容差（Stein 1994；matchms.similarity.CosineGreedy 官方实现，缺 matchms 时回退内置余弦）",
         "needs": ["ms2"],
         "params": [
             {"key": "ppm", "label": "前体容差 ppm", "type": "number", "default": 20},
@@ -807,7 +1118,7 @@ ANALYSES = [
     },
     {
         "id": "ms2_network", "title": "分子网络", "group": "代谢物鉴定",
-        "method": "余弦网络 + 连通分量（GNPS 分子网络思路，Wang 2016；内置实现）",
+        "method": "余弦网络 + 连通分量（GNPS 分子网络思路，Wang 2016；matchms CosineGreedy 余弦矩阵，缺 matchms 时回退内置）",
         "needs": ["ms2"],
         "params": [
             {"key": "min_score", "label": "最低余弦", "type": "number", "default": 0.6},

@@ -33,7 +33,7 @@ if HERE not in sys.path:
 
 PLUGIN_VERSION = "0.1.0"
 PACKAGE_NAMES = ["numpy", "pandas", "scipy", "sklearn", "matplotlib", "statsmodels", "openpyxl", "h5py"]
-OPTIONAL_PACKAGES = ["lifelines", "PIL", "networkx", "anndata", "seaborn"]
+OPTIONAL_PACKAGES = ["lifelines", "PIL", "networkx", "anndata", "seaborn", "matchms", "rdkit", "scanpy"]
 METABOLIGHTS_PING_URL = "https://www.ebi.ac.uk/metabolights/ws/studies"
 
 
@@ -185,6 +185,10 @@ class Worker:
 
             dataset = mb_state.make_demo(state, name=args.get("name") or "demo-metabo")
             registry.ensure_fields(dataset)
+            try:
+                state.select(dataset.id)   # 新建/载入的数据集应当成为当前数据集
+            except Exception:  # noqa: BLE001
+                state.active = dataset.id
             return {"dataset": registry.dataset_summary(dataset), "preview": registry.preview(dataset)}
 
         raw_path = args.get("path") or args.get("url")

@@ -321,8 +321,9 @@ def _fetch_bytes(url: str, *, timeout: int = HTTP_TIMEOUT, retries: int = 2,
     raise _network_fail(last_error, _host_of(url))
 
 
-def _fetch_json(url: str, *, retries: int = 2, soft_404: bool = False, host: str | None = None):
-    raw = _fetch_bytes(url, retries=retries, soft_404=soft_404)
+def _fetch_json(url: str, *, retries: int = 2, soft_404: bool = False, host: str | None = None,
+                timeout: int = HTTP_TIMEOUT):
+    raw = _fetch_bytes(url, retries=retries, soft_404=soft_404, timeout=timeout)
     if raw is None:
         return None
     try:
@@ -533,6 +534,18 @@ def _make_tags(title: str, summary: str, species: str, study_type: str, disease:
 # ---------------------------------------------------------------------------
 
 
+_METHOD_QUERY_TERMS = {
+    "lc-ms": '("LC-MS"[All Fields] OR "liquid chromatography"[All Fields] OR "LC-MS/MS"[All Fields] OR "UPLC"[All Fields] OR "HPLC"[All Fields])',
+    "gc-ms": '("GC-MS"[All Fields] OR "gas chromatography"[All Fields])',
+    "nmr": '("NMR"[All Fields] OR "nuclear magnetic resonance"[All Fields])',
+    "ms": '("mass spectrometry"[All Fields] OR "LC-MS"[All Fields] OR "GC-MS"[All Fields] OR "metabolomics"[All Fields])',
+}
+
+
+def _method_clause(method: str) -> str:
+    return _METHOD_QUERY_TERMS.get(str(method or "all").strip().lower(), "")
+
+
 def _build_query(term: str, species: str, study_type: str, min_samples: int) -> str:
     clauses = [f"({term})"]
     if "etyp" not in term.lower():
@@ -705,6 +718,13 @@ def geo_search(term, species="all", method="all", min_samples=0, has_clinical=Fa
                               "关键词里的中文没能翻译成英文，请改用英文关键词或补充疾病名（如：糖尿病 → diabetes）")
 
     needs_filter = bool(has_clinical) or sort_mode != "relevance" or str(method or "all").lower() not in ("all", "", "any")
+    # 选了技术（LC-MS/GC-MS/NMR）就把技术词并进检索式：比只做事后过滤召回更全，
+    # 也不会因为候选池只有 60 条而误报「只有 3 条」。
+    if str(method or "all").lower() not in ("all", "", "any"):
+        clause = _method_clause(method)
+        if clause:
+            query_term = f"({query_term}) AND {clause}"
+            translated["query_en"] = query_term
     cascade = _cascade_terms(query_term)
     selected_term = cascade[0]
     ids: list[str] = []
@@ -736,16 +756,18 @@ def geo_search(term, species="all", method="all", min_samples=0, has_clinical=Fa
         if has_clinical:
             items = [item for item in items if item.get("has_clinical")]
         if str(method or "all").lower() not in ("all", "", "any"):
+            # 严格按技术筛选：选了 LC-MS 就只给 LC-MS 的系列；不命中返回空 + 提示，
+            # 而不是拿一堆不相关数据充数（用户会被"明明选了仪器还全是别的"搞懵）。
             filtered = [item for item in items if _method_matches(method, item.get("method", "unknown"))]
-            if filtered:
-                items = filtered
-            elif items:
-                translated.setdefault("notes", []).append("技术过滤未命中，已返回全部结果")
+            items = filtered
+            if not filtered:
+                translated.setdefault("notes", []).append(
+                    "没有命中该技术的系列：可去掉技术筛选，或改用更通用的关键词（如只写代谢组学/metabolomics）")
         if sort_mode != "relevance":
             items = _sort_items(items, sort_mode)
         start = page * limit
+        total = len(items)          # 过滤后总数（别把未过滤的命中数当结果数）
         items = items[start:start + limit]
-        total = len(items) if total == 0 else total
 
     if not items and not ids:
         raise EngineError("not_found",
@@ -1308,7 +1330,7 @@ def ml_search(query, limit=20, page=0, assay_type=None, **kw) -> dict:
         params = urllib.parse.urlencode({"query": term, "format": "json", "size": page_size,
                                          "start": (start // page_size) * page_size})
         data = _fetch_json(f"https://www.ebi.ac.uk/ebisearch/ws/rest/metabolights?{params}",
-                           host="MetaboLights（EBI）") or {}
+                           host="MetaboLights（EBI）", timeout=12, retries=0) or {}
         hit_count = int(data.get("hitCount") or 0) or None
         accessions = [str(item.get("id")) for item in (data.get("entries") or [])
                       if isinstance(item, dict) and str(item.get("id") or "").startswith("MTBLS")]
@@ -1321,7 +1343,7 @@ def ml_search(query, limit=20, page=0, assay_type=None, **kw) -> dict:
         accessions = []
     if ebisearch_failed and not accessions:
         params = urllib.parse.urlencode({"searchString": term, "page": page, "size": limit})
-        data = _fetch_json(f"{ML_API}/studies?{params}", host="MetaboLights（EBI）") or {}
+        data = _fetch_json(f"{ML_API}/studies?{params}", host="MetaboLights（EBI）", timeout=12, retries=0) or {}
         accessions = [str(item) for item in (data.get("content") or []) if str(item).strip()][:limit]
         hit_count = None
     if not accessions and not ebisearch_failed:
@@ -1337,34 +1359,51 @@ def ml_search(query, limit=20, page=0, assay_type=None, **kw) -> dict:
         except EngineError:
             return acc, None
 
-    # 元信息预算：EBI 的 public/study 每个约 3-15s，limit=20 串行会撞 120s 引擎超时。
-    # 超过预算就不取元信息的条目只回 accession（needs_detail=true），UI 点开再 ml_detail。
-    budget = 25.0
+    # 元信息预算：EBI 的 public/study 每个约 3-15s 且抖动大，limit=20 全量取会撞 120s 引擎超时。
+    # 只对前 enrich_max 条取元信息（滑动窗口并发 + 预算），其余只回编号（needs_detail=true）。
+    budget = 12.0
+    enrich_max = 6
     if isinstance(kw, dict):
         try:
-            budget = float(kw.get("budget_s") or kw.get("budget") or 25.0)
+            budget = float(kw.get("budget_s") or kw.get("budget") or 12.0)
         except (TypeError, ValueError):
-            budget = 25.0
-    if targets:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+            budget = 12.0
+        try:
+            enrich_max = int(kw.get("enrich_max") or 6)
+        except (TypeError, ValueError):
+            enrich_max = 6
+    enrich_max = max(0, min(enrich_max, len(targets)))
+    if enrich_max:
+        from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as _wait
         import time as _time
 
         started_at = _time.time()
-        with ThreadPoolExecutor(max_workers=min(6, len(targets))) as pool:
-            futures = {pool.submit(_one, acc): acc for acc in targets}
-            for future in as_completed(futures):
-                acc = futures[future]
-                try:
-                    _acc, meta = future.result()
-                except Exception:  # noqa: BLE001
-                    meta = None
-                if meta is not None:
-                    metas[acc] = meta
-                if _time.time() - started_at >= budget and len(metas) < len(targets):
-                    for pending in futures:
-                        if pending is not future:
-                            pending.cancel()
+        pending: dict = {}
+        queue = list(targets[:enrich_max])
+        pool = ThreadPoolExecutor(max_workers=min(4, enrich_max))
+        try:
+            while queue or pending:
+                while queue and len(pending) < pool._max_workers and (_time.time() - started_at) < budget:
+                    acc = queue.pop(0)
+                    pending[pool.submit(_one, acc)] = acc
+                if not pending:
                     break
+                done, _not_done = _wait(list(pending), timeout=max(0.2, budget - (_time.time() - started_at)),
+                                        return_when=FIRST_COMPLETED)
+                for future in done:
+                    acc = pending.pop(future, None)
+                    try:
+                        _acc, meta = future.result()
+                    except Exception:  # noqa: BLE001
+                        meta = None
+                    if meta is not None and acc:
+                        metas[acc] = meta
+                if (_time.time() - started_at) >= budget:
+                    break
+        finally:
+            for future in list(pending):
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
     truncated = 0
     for accession in targets:
         meta = metas.get(accession)
@@ -1424,13 +1463,14 @@ def ml_detail(accession, with_files: bool = True, with_sizes: bool = False) -> d
     """
     acc = _norm_ml(accession)
     meta_raw = _fetch_json(f"{ML_API}/studies/public/study/{acc}", soft_404=True,
-                           host="MetaboLights（EBI）")
+                           host="MetaboLights（EBI）", timeout=15, retries=1)
     meta = (meta_raw or {}).get("content") if isinstance(meta_raw, dict) else None
     if not isinstance(meta, dict):
         raise EngineError("not_found", f"MetaboLights 研究 {acc} 不存在或未公开")
     files = []
     if with_files:
-        files_raw = _fetch_json(f"{ML_API}/studies/{acc}/files", soft_404=True, host="MetaboLights（EBI）")
+        files_raw = _fetch_json(f"{ML_API}/studies/{acc}/files", soft_404=True,
+                                host="MetaboLights（EBI）", timeout=15, retries=1)
         for entry in ((files_raw or {}).get("study") or []) if isinstance(files_raw, dict) else []:
             if not isinstance(entry, dict) or entry.get("directory"):
                 continue

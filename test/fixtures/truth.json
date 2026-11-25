@@ -1,8 +1,8 @@
 {
- "root": "test/fixtures",
+ "root": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures",
  "cases": {
   "samples_x_features": {
-   "file": "test/fixtures/samples_x_features.csv",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/samples_x_features.csv",
    "format": "matrix_text",
    "n_samples": 8,
    "n_features": 6,
@@ -98,7 +98,7 @@
    "trailing_rows_dropped": 1
   },
   "features_x_samples": {
-   "file": "test/fixtures/features_x_samples.tsv",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/features_x_samples.tsv",
    "format": "matrix_text",
    "n_samples": 8,
    "n_features": 5,
@@ -221,7 +221,7 @@
    }
   },
   "xlsx": {
-   "file": "test/fixtures/metabo.xlsx",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/metabo.xlsx",
    "format": "xlsx",
    "n_samples": 8,
    "n_features": 5,
@@ -308,7 +308,7 @@
    "sheet": "data"
   },
   "xlsx_ambiguous": {
-   "file": "test/fixtures/multisheet.xlsx",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/multisheet.xlsx",
    "format": "xlsx",
    "ambiguous": true,
    "candidates": [
@@ -321,7 +321,7 @@
    ]
   },
   "gzip": {
-   "file": "test/fixtures/samples_x_features.tsv.gz",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/samples_x_features.tsv.gz",
    "format": "matrix_text",
    "n_samples": 8,
    "n_features": 6,
@@ -416,7 +416,7 @@
    "has_rt": true
   },
   "zero_table": {
-   "file": "test/fixtures/feature_table_mz_rt.tsv",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/feature_table_mz_rt.tsv",
    "format": "matrix_text",
    "n_samples": 4,
    "n_features": 4,
@@ -469,7 +469,7 @@
    ]
   },
   "archive_single": {
-   "file": "test/fixtures/features.zip",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/features.zip",
    "format": "matrix_text",
    "n_samples": 8,
    "n_features": 3,
@@ -538,7 +538,7 @@
    "member": "data/feature_table.csv"
   },
   "archive_multi": {
-   "file": "test/fixtures/multi_candidate.zip",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/multi_candidate.zip",
    "format": "archive",
    "ambiguous": true,
    "candidates": [
@@ -562,7 +562,7 @@
    ]
   },
   "mztab": {
-   "file": "test/fixtures/study.mztab",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/study.mztab",
    "format": "mztab",
    "n_samples": 2,
    "n_features": 3,
@@ -611,7 +611,7 @@
    }
   },
   "isa_tab": {
-   "file": "test/fixtures/isa/m_DEMO_metabolite_profiling_v2_maf.tsv",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/isa/m_DEMO_metabolite_profiling_v2_maf.tsv",
    "format": "isa_tab",
    "n_samples": 5,
    "n_features": 4,
@@ -665,7 +665,7 @@
    ],
    "has_mz": true,
    "has_rt": true,
-   "folder": "test/fixtures/isa",
+   "folder": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/isa",
    "sample_columns": [
     "characteristics_organism",
     "characteristics_gender",
@@ -674,7 +674,7 @@
    ]
   },
   "msms_library": {
-   "file": "test/fixtures/library.msp",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/library.msp",
    "format": "msms_library",
    "n_spectra": 3,
    "ids": [
@@ -694,7 +694,7 @@
    ]
   },
   "mzml_tic": {
-   "file": "test/fixtures/tiny.mzML",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/tiny.mzML",
    "format": "mzml_tic",
    "tic_time": [
     0.5,
@@ -722,7 +722,7 @@
    ]
   },
   "geo_series": {
-   "file": "test/fixtures/geo_series.txt",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/geo_series.txt",
    "format": "geo_series",
    "n_samples": 3,
    "n_features": 4,
@@ -771,7 +771,7 @@
    ]
   },
   "no_header": {
-   "file": "test/fixtures/matrix_no_header.tsv",
+   "file": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/matrix_no_header.tsv",
    "format": "matrix_text",
    "n_samples": 3,
    "n_features": 5,
@@ -817,15 +817,15 @@
    "has_rt": false
   },
   "bad": {
-   "empty": "test/fixtures/bad/empty.csv",
-   "binary": "test/fixtures/bad/binary.bin",
-   "broken_zip": "test/fixtures/bad/broken.zip",
-   "broken_xlsx": "test/fixtures/bad/broken.xlsx",
-   "text_only": "test/fixtures/bad/text_only.csv"
+   "empty": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/bad/empty.csv",
+   "binary": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/bad/binary.bin",
+   "broken_zip": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/bad/broken.zip",
+   "broken_xlsx": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/bad/broken.xlsx",
+   "text_only": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/bad/text_only.csv"
   },
   "info_tables": {
-   "sample_sheet": "test/fixtures/sample_sheet.csv",
-   "clinical": "test/fixtures/clinical.csv"
+   "sample_sheet": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/sample_sheet.csv",
+   "clinical": "/Users/dingyuntao/Desktop/deepseek harness/plugins/dsh-metabolomics/test/fixtures/clinical.csv"
   }
  }
 }

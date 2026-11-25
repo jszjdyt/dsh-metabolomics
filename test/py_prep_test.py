@@ -499,10 +499,21 @@ def run_branch_smoke(ctx_initial) -> None:
                                                 {"transform": transform, "scale": scale}, outdir)
             check_envelope(payload, f"branch:transform:{transform}:{scale}")
             kind = payload["replace"].get("X_kind")
+            # P0-1 三值语义（BIO_P0_BACKLOG §4）：有标度 → scaled；仅 log → lognorm；
+            # 仅 cuberoot → transformed；transform+scale 都为 none 时不写 X_kind。
             if transform == "none" and scale == "none":
-                assert kind is None, "transform+scale 都为 none 时不应强行写 X_kind=scaled"
-            else:
+                assert kind is None, "transform+scale 都为 none 时不应强行写 X_kind"
+            elif scale != "none":
                 assert kind == "scaled", f"transform={transform} scale={scale} 后 X_kind 应为 scaled"
+            elif transform in ("log2", "log10"):
+                assert kind == "lognorm", f"仅 {transform} 未标度时 X_kind 应为 lognorm，得到 {kind}"
+            else:
+                assert kind == "transformed", f"仅 {transform} 未标度时 X_kind 应为 transformed，得到 {kind}"
+            # P0-1：三层快照必须随 transform 步骤写入 store
+            layers = (payload.get("store") or {}).get("transform", {}).get("layers") or {}
+            values = layers.get("values") or {}
+            assert isinstance(values, dict) and values.get("model") is not None, \
+                f"transform={transform} scale={scale} 未保存 model 层快照"
     print("[branch] transform × scale 16 个组合 -> 全部跑通 ✓")
 
     # pca 的 color_by 分支（batch / qc / none）：先变换到 scaled（pca 会拒绝 raw）

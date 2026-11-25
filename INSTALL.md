@@ -1,6 +1,34 @@
 # 安装
 
-## 依赖（本机 python3 已具备，无需安装）
+## 依赖
+
+### Python：专用生物信息环境
+
+```bash
+uv venv --python 3.12 ~/.dsh/runtimes/bio312
+uv pip install --python ~/.dsh/runtimes/bio312/bin/python \
+  "numpy<2.4" "pandas<3" scipy scikit-learn matplotlib seaborn anndata \
+  scanpy squidpy umap-learn leidenalg igraph harmonypy scikit-misc \
+  statsmodels openpyxl h5py networkx lifelines pillow certifi \
+  matchms pyopenms
+```
+
+### R：ropls（PLS-DA / OPLS-DA 真包）
+
+`bioconductor.org` 不可达时（本机情况）用源码装：
+
+```bash
+git clone --depth 1 https://git.bioconductor.org/packages/ropls /tmp/ropls_src
+# 只去掉 MultiAssayExperiment / MultiDataSet 两个对象互操作依赖后安装：
+R CMD INSTALL --no-test-load /tmp/ropls_build
+Rscript -e 'requireNamespace("ropls", quietly=TRUE)'
+```
+
+（本机同时装了 `spacexr`（RCTD）供空间插件反卷积用。）
+
+### 回退环境（宿主自带 python3）
+
+```bash
 
 ```bash
 python3 -c "import numpy,pandas,scipy,sklearn,matplotlib,statsmodels,openpyxl,h5py,anndata,lifelines,PIL,certifi"

@@ -121,6 +121,56 @@ def _sqlite_bool(value) -> int:
     return 0
 
 
+#: 事件列显式映射（BIO_P0_BACKLOG §4 P0-3）。只认下面这些显式取值，其余一律视为未知：
+#: 旧实现把未知文本静默记成 0（删失），等于把"不知道"当成"没发生"，会系统性高估生存、低估风险。
+EVENT_POSITIVE = ("1", "1.0", "true", "yes", "y", "dead", "death", "deceased", "event",
+                  "recurrence", "recur", "relapse", "progressed", "progression")
+EVENT_NEGATIVE = ("0", "0.0", "false", "no", "n", "alive", "censored", "censor", "living",
+                  "none", "disease_free", "df", "no_event")
+
+
+def _event_value(value) -> str | None:
+    """把事件列原始值规整成小写文本；空/NaN/None 返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return "1" if bool(value) else "0"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return str(int(number)) if number.is_integer() else str(number)
+    text = str(value).strip().lower()
+    if text in ("", "nan", "none", "null", "na", "n/a", "missing", "unknown", "?"):
+        return None
+    return text
+
+
+def _event_code(value, event_map: dict[str, int] | None = None) -> int | None:
+    """显式事件编码：返回 1/0；无法识别返回 None（调用方决定 bad_request 还是按 NA 丢弃）。"""
+    text = _event_value(value)
+    if text is None:
+        return None
+    if event_map:
+        if text in event_map:
+            mapped = event_map[text]
+            return 1 if float(mapped) >= 0.5 else 0
+        # 事件映射支持数值键（如 {1:1, 2:0}）
+        try:
+            number = int(float(text))
+            if number in event_map:
+                return 1 if float(event_map[number]) >= 0.5 else 0
+        except (TypeError, ValueError):
+            pass
+    if text in EVENT_POSITIVE:
+        return 1
+    if text in EVENT_NEGATIVE:
+        return 0
+    return None
+
+
 def _feature_column(ctx, column: str) -> dict[str, object]:
     """feature_info 的某列 → 特征 → 取值（缺列返回空 dict）。"""
     info = _feature_info(ctx)
@@ -353,8 +403,13 @@ def _binary_subset(setup: dict, params: dict, notes: list[str]) -> tuple[np.ndar
 # ---------------------------------------------------------------------------
 
 
-def _matrix_subset(ctx, indices: np.ndarray, keep: np.ndarray, warnings: list[str]):
-    """取候选特征子矩阵（已按样本掩码筛选 + 中位数填补），返回 X/特征名/填补说明。"""
+def _matrix_subset(ctx, indices: np.ndarray, keep: np.ndarray, warnings: list[str],
+                   impute: bool = True):
+    """取候选特征子矩阵（按样本掩码筛选；默认中位数填补），返回 (X, 特征名)。
+
+    ``impute=False`` 时保留 NaN，供嵌套交叉验证/自助法在**每个训练折内部**重新估计
+    填补参数（P0-2：填补也是"看数据"的决策，不能在全样本上先做）。
+    """
     X = _raw_X(ctx)
     features = _features(ctx)
     idx = np.asarray(indices, dtype=int)
@@ -362,7 +417,7 @@ def _matrix_subset(ctx, indices: np.ndarray, keep: np.ndarray, warnings: list[st
         raise prerequisite("候选特征为空：差异表与当前矩阵没有交集，请重跑差异分析")
     sub = X[keep][:, idx]
     n_imputed = int(np.isnan(sub).sum())
-    if n_imputed:
+    if n_imputed and impute:
         medians = np.nanmedian(np.where(np.isfinite(sub), sub, np.nan), axis=0)
         medians = np.where(np.isfinite(medians), medians, 0.0)
         rows, cols = np.where(~np.isfinite(sub))
@@ -753,17 +808,26 @@ def _clinical_columns(ctx, params) -> tuple[str | None, str | None]:
         for col in info.columns:
             key = str(col).lower()
             if any(p in key for p in event_patterns):
-                values = pd.to_numeric(info[col], errors="coerce")
-                if values.notna().sum() >= max(3, int(len(values) * 0.5)):
-                    unique = set(values.dropna().astype(float).round().astype(int).unique().tolist())
-                    if unique <= {0, 1}:
-                        event_col = str(col)
-                        break
+                # 事件列可以是 0/1 数值，也可以是 dead/alive 这类显式文本；未知取值不算"可解析"
+                codes = [_event_code(value) for value in info[col].tolist()]
+                known = int(sum(code is not None for code in codes))
+                if known >= max(3, int(len(codes) * 0.5)):
+                    event_col = str(col)
+                    break
     return time_col, event_col
 
 
-def _survival_columns(ctx, params) -> tuple[np.ndarray, np.ndarray, str, str]:
-    """取 (时间, 事件, time_col, event_col)；缺列抛 prerequisite。"""
+def _survival_columns(ctx, params, warnings: list[str] | None = None
+                      ) -> tuple[np.ndarray, np.ndarray, str, str]:
+    """取 (时间, 事件, time_col, event_col)。
+
+    事件列必须显式映射（BIO_P0_BACKLOG §4 P0-3）：
+      * ``event_map`` 可显式指定 ``{"progression": 1, "stable": 0}``；
+      * 内置只认 dead/alive/censored/1/0 等明确取值；
+      * 未知取值默认 ``bad_request``（列出取值与样本数），不允许静默当删失；
+      * ``event_unknown="na"``：未知事件样本的时间/事件置 NaN（下游自动剔除）并写 warning。
+    """
+    params = dict(params or {})
     time_col, event_col = _clinical_columns(ctx, params)
     info = _info(ctx)
     if not time_col or time_col not in info.columns:
@@ -771,9 +835,52 @@ def _survival_columns(ctx, params) -> tuple[np.ndarray, np.ndarray, str, str]:
     if not event_col or event_col not in info.columns:
         raise prerequisite("样本信息里缺少生存事件列（event/status/dead 等），请先导入临床表或指定 event_col")
     times = pd.to_numeric(info[time_col], errors="coerce").to_numpy(dtype=float)
-    events = np.asarray([_sqlite_bool(v) for v in info[event_col].tolist()], dtype=int)
-    valid = np.isfinite(times) & (times > 0)
+    times = np.where(np.isfinite(times) & (times > 0), times, np.nan)
+    raw_map = params.get("event_map") or {}
+    event_map: dict[str, int] = {}
+    if isinstance(raw_map, dict):
+        for key, value in raw_map.items():
+            text = _event_value(key)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if text is not None:
+                event_map[text] = 1 if number >= 0.5 else 0
+    unknown_mode = str(params.get("event_unknown") or "error").strip().lower()
+    drop_unknown = unknown_mode in ("na", "nan", "drop", "na_drop", "drop_unknown")
+    codes: list[float] = []
+    unknown_positions: list[int] = []
+    unknown_counts: dict[str, int] = {}
+    for position, value in enumerate(info[event_col].tolist()):
+        code = _event_code(value, event_map)
+        if code is None:
+            codes.append(np.nan)
+            unknown_positions.append(position)
+            label = "空值" if _event_value(value) is None else str(value).strip()
+            unknown_counts[label] = unknown_counts.get(label, 0) + 1
+        else:
+            codes.append(float(code))
+    events = np.asarray(codes, dtype=float)
+    if unknown_positions:
+        shown = "、".join(f"{value}×{count}" for value, count in list(unknown_counts.items())[:6])
+        total = len(info)
+        message = (
+            f"事件列「{event_col}」有 {len(unknown_positions)}/{total} 个无法识别的取值（{shown}）："
+            f"生存事件必须显式映射为 0/1 或 dead/alive/censored 等明确取值，不能把未知当删失"
+        )
+        if not drop_unknown:
+            raise bad_request(
+                message + "；请传 event_map（如 {'progression':1,'stable':0}），"
+                          "或显式设置 event_unknown='na' 把这些样本按 NA 丢弃"
+            )
+        times = times.copy()
+        times[unknown_positions] = np.nan
+        if warnings is not None:
+            warnings.append(message + "；按 event_unknown='na' 已将这些样本置 NA（下游自动剔除）")
+    valid = np.isfinite(times) & np.isfinite(events) & (times > 0)
     times = np.where(valid, times, np.nan)
+    events = np.where(valid, events, np.nan)
     return times, events, str(time_col), str(event_col)
 
 
@@ -1260,45 +1367,331 @@ def _logit_model(X: np.ndarray, y: np.ndarray):
     ])
 
 
-def _bootstrap_optimism(X: np.ndarray, y: np.ndarray, n_boot: int, notes: list[str],
-                        warnings: list[str]) -> dict:
-    """Harrell 自助法乐观度：每次重抽样拟合 → 自助样本内 AUC − 原样本 AUC，取均值。"""
-    from sklearn.base import clone  # noqa: PLC0415
+# ---------------------------------------------------------------------------
+# 7b. 嵌套交叉验证：训练折内完成 填补 → 标度 → 筛选 → 模型 → 阈值（P0-2 防泄漏）
+#
+# 旧实现的泄漏路径：全样本做特征筛选/填补/标准化 → 再交叉验证。纯噪声下全样本
+# |Cohen's d| 预筛能把 AUC 抬到 ~0.99。下面的实现保证任何"看标签"的决策（筛选、阈值、
+# 超参）都只在训练折内做，测试折只做 predict；有受试者 ID 时按个体整块划分。
+# ---------------------------------------------------------------------------
 
-    n_boot = int(max(10, min(MAX_BOOT, n_boot)))
-    base = _logit_model(X, y)
-    with _warnings.catch_warnings():
-        _warnings.simplefilter("ignore")
-        base.fit(X, y)
-    apparent = _auc_binary(y, base.predict_proba(X)[:, 1])
+SUBJECT_COL_HINTS = ("subject", "subject_id", "patient", "patient_id", "donor", "donor_id",
+                     "individual", "participant", "case_id", "animal", "mouse")
+DEFAULT_SCREEN_LIMIT = 500   # 高维时折内单变量预筛上限（只为控制模型成本，不改变 fold 边界）
+
+
+def _find_column(info: pd.DataFrame, hints) -> str | None:
+    """按关键词找一列（先精确匹配，再包含匹配）。"""
+    if not isinstance(info, pd.DataFrame):
+        return None
+    columns = [str(column) for column in info.columns]
+    lowered = {column.lower(): column for column in columns}
+    for hint in hints:
+        if hint in lowered:
+            return lowered[hint]
+    for hint in hints:
+        for column in columns:
+            if hint in column.lower():
+                return column
+    return None
+
+
+def _subject_vector(ctx, params: dict) -> tuple[np.ndarray | None, str | None]:
+    """取受试者/患者 ID 向量，供按个体分组划分与自助法整块重抽；无则返回 (None, None)。"""
+    params = dict(params or {})
+    info = _info(ctx)
+    samples = _samples(ctx)
+    explicit = str(params.get("subject_col") or "").strip()
+    column: str | None = None
+    if explicit:
+        if explicit not in info.columns:
+            raise bad_request(
+                f"subject_col「{explicit}」不在样本信息里；可选列：{'、'.join(map(str, info.columns))}"
+            )
+        column = explicit
+    if column is None:
+        column = _find_column(info, SUBJECT_COL_HINTS)
+    if not column or len(info) != len(samples):
+        return None, None
+    values = [str(value).strip() for value in info[column].tolist()]
+    if any(value == "" or value.lower() in ("nan", "none", "na") for value in values):
+        return None, None
+    return np.asarray(values, dtype=object), column
+
+
+def _impute_medians(train: np.ndarray) -> np.ndarray:
+    """训练折逐特征中位数（只在训练折上估计，测试折复用）。"""
+    arr = np.asarray(train, dtype=float)
+    with np.errstate(invalid="ignore"):
+        median = np.nanmedian(np.where(np.isfinite(arr), arr, np.nan), axis=0)
+    return np.where(np.isfinite(median), median, 0.0)
+
+
+def _impute_apply(arr: np.ndarray, median: np.ndarray) -> np.ndarray:
+    out = np.array(np.asarray(arr, dtype=float), copy=True)
+    rows, cols = np.where(~np.isfinite(out))
+    if rows.size:
+        out[rows, cols] = np.asarray(median, dtype=float)[cols]
+    return out
+
+
+def _cohen_d(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """逐特征 Cohen's d（正类 − 负类），只应传入训练折。"""
+    y = np.asarray(y, dtype=int)
+    pos = X[y == 1]
+    neg = X[y == 0]
+    if pos.shape[0] < 2 or neg.shape[0] < 2:
+        raise prerequisite("训练折内某一类样本少于 2 个，无法做单变量筛选")
+    mean_pos = pos.mean(axis=0)
+    mean_neg = neg.mean(axis=0)
+    var_pos = pos.var(axis=0, ddof=1)
+    var_neg = neg.var(axis=0, ddof=1)
+    pooled = np.sqrt(np.maximum((var_pos + var_neg) / 2.0, 0.0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        score = np.where(pooled > 0, (mean_pos - mean_neg) / pooled, 0.0)
+    return np.where(np.isfinite(score), score, 0.0)
+
+
+def _select_in_fold(X_train: np.ndarray, y_train: np.ndarray, n_features: int) -> tuple[np.ndarray, np.ndarray]:
+    """**只在训练折内**用 |Cohen's d| 选特征；测试折不得参与（P0-2 核心约束）。"""
+    scores = _cohen_d(X_train, y_train)
+    k = int(max(1, min(int(n_features), X_train.shape[1])))
+    order = np.argsort(-np.abs(scores), kind="stable")[:k]
+    return np.sort(order), scores
+
+
+def _classifier(model: str, n_trees: int = 100, seed: int = SEED):
+    kind = str(model or "logit").strip().lower()
+    if kind in ("rf", "randomforest", "random_forest"):
+        from sklearn.ensemble import RandomForestClassifier  # noqa: PLC0415
+
+        return RandomForestClassifier(
+            n_estimators=max(20, int(n_trees)), random_state=seed, n_jobs=1,
+            min_samples_leaf=2, class_weight="balanced_subsample", max_features="sqrt")
+    from sklearn.linear_model import LogisticRegression  # noqa: PLC0415
+
+    return LogisticRegression(C=1.0, max_iter=4000, solver="lbfgs",
+                              class_weight="balanced", random_state=seed)
+
+
+def _fit_pipeline(X_train: np.ndarray, y_train: np.ndarray, n_features: int = DEFAULT_N_FEATURES,
+                  model: str = "logit", n_trees: int = 100) -> dict:
+    """训练折内的完整流程：中位数填补 → 标准化 → 折内筛选 → 模型。测试折只做 transform。"""
+    from sklearn.preprocessing import StandardScaler  # noqa: PLC0415
+
+    median = _impute_medians(X_train)
+    filled = _impute_apply(X_train, median)
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(filled)
+    picked, _scores = _select_in_fold(scaled, y_train, n_features)
+    estimator = _classifier(model, n_trees=n_trees)
+    estimator.fit(scaled[:, picked], np.asarray(y_train, dtype=int))
+    return {"median": median, "scaler": scaler, "picked": picked, "model": estimator,
+            "model_kind": str(model)}
+
+
+def _predict_pipeline(pipe: dict, X: np.ndarray) -> np.ndarray:
+    filled = _impute_apply(X, pipe["median"])
+    scaled = pipe["scaler"].transform(filled)
+    proba = pipe["model"].predict_proba(scaled[:, pipe["picked"]])
+    return np.asarray(proba[:, 1], dtype=float)
+
+
+def _apparent_auc(X: np.ndarray, y: np.ndarray, n_features: int = DEFAULT_N_FEATURES,
+                  model: str = "logit", n_trees: int = 100) -> float:
+    """表观 AUC：全样本拟合后在**同一批样本**上评估（乐观，明确标为 apparent）。"""
+    pipe = _fit_pipeline(X, y, n_features=n_features, model=model, n_trees=n_trees)
+    return float(_auc_binary(y, _predict_pipeline(pipe, X)))
+
+
+def _youden_threshold(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """Youden J 最大化的阈值（Sensitivity + Specificity − 1），只用训练折内层 OOF。"""
+    y_true = np.asarray(y_true, dtype=int)
+    proba = np.asarray(proba, dtype=float)
+    ok = np.isfinite(proba)
+    if int(ok.sum()) < 4 or np.unique(y_true[ok]).size < 2:
+        return 0.5
+    from sklearn.metrics import roc_curve  # noqa: PLC0415
+
+    fpr, tpr, thresholds = roc_curve(y_true[ok], proba[ok])
+    index = int(np.argmax(tpr - fpr))
+    value = float(thresholds[index])
+    if not (0.0 < value < 1.0) or not math.isfinite(value):
+        value = float(np.median(proba[ok]))
+    return value
+
+
+def _cv_splitter(y: np.ndarray, groups, folds: int, seed: int):
+    """按是否有受试者 ID 选择分层样本划分或分层个体划分。"""
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold  # noqa: PLC0415
+
+    y = np.asarray(y, dtype=int)
+    counts = np.bincount(y, minlength=2)
+    counts = counts[counts > 0]
+    if counts.size < 2:
+        raise prerequisite("目标变量只有 1 个类别，无法做交叉验证/ROC，请检查分组列")
+    if groups is not None:
+        groups = np.asarray(groups, dtype=object)
+        folds_used = int(max(2, min(int(folds), int(np.unique(groups).size))))
+        try:
+            return StratifiedGroupKFold(n_splits=folds_used, shuffle=True, random_state=seed), folds_used, True
+        except Exception:  # noqa: BLE001 - 极老 sklearn 回退到 GroupKFold
+            from sklearn.model_selection import GroupKFold  # noqa: PLC0415
+
+            return GroupKFold(n_splits=folds_used), folds_used, True
+    folds_used = int(max(2, min(int(folds), int(counts.min()))))
+    return StratifiedKFold(n_splits=folds_used, shuffle=True, random_state=seed), folds_used, False
+
+
+def _split_folds(splitter, X, y, groups, folds_used: int):
+    """生成划分；分层个体划分在极端分布下会失败，回退 GroupKFold。"""
+    try:
+        return list(splitter.split(X, y, groups))
+    except Exception:  # noqa: BLE001
+        from sklearn.model_selection import GroupKFold  # noqa: PLC0415
+
+        if groups is None:
+            raise
+        return list(GroupKFold(n_splits=folds_used).split(X, y, groups))
+
+
+def _inner_oof_scores(X: np.ndarray, y: np.ndarray, folds: int, n_features: int,
+                      model: str, n_trees: int, groups=None, seed: int = SEED + 1) -> np.ndarray:
+    """内层交叉验证的外推概率（每个内层训练折内部再走一遍完整 pipeline）。"""
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=int)
+    groups_arr = None if groups is None else np.asarray(groups, dtype=object)
+    splitter, folds_used, _grouped = _cv_splitter(y, groups_arr, folds, seed)
+    oof = np.full(y.size, np.nan)
+    for inner_train, inner_test in _split_folds(splitter, X, y, groups_arr, folds_used):
+        y_train = y[inner_train]
+        if np.unique(y_train).size < 2:
+            continue
+        try:
+            pipe = _fit_pipeline(X[inner_train], y_train, n_features=n_features,
+                                 model=model, n_trees=n_trees)
+            oof[inner_test] = _predict_pipeline(pipe, X[inner_test])
+        except (EngineError, ValueError):
+            continue
+    return oof
+
+
+def nested_cv_auc(X, y, groups=None, folds: int = DEFAULT_CV_FOLDS, seed: int = SEED,
+                  n_features: int = DEFAULT_N_FEATURES, model: str = "logit",
+                  n_trees: int = 100, inner_folds: int = 3) -> dict:
+    """嵌套交叉验证 AUC（外层评估、内层取阈值）：训练折内完成填补/标度/筛选/模型/阈值。
+
+    每个外层折：训练折上估中位数填补参数 → 标准化 → 用训练折 |Cohen's d| 选 top n_features
+    → 训练折内层 CV 的 OOF 概率取 Youden 阈值 → 模型拟合 → 只在测试折上预测；测试折的标签
+    从不参与任何选择。传入受试者 ``groups`` 时用分层个体划分（同个体重复样本不跨折）。
+
+    返回 ``{"auc","folds","fold_aucs","fold_thresholds","n_features","grouped","oof_proba",...}``。
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=int).ravel()
+    if X.ndim != 2:
+        raise bad_request(f"X 必须是二维矩阵（样本×特征），收到 {X.shape}")
+    if X.shape[0] != y.size:
+        raise bad_request(f"X 的样本数 {X.shape[0]} 与标签数 {y.size} 不一致")
+    if y.size < 8:
+        raise prerequisite(f"样本数只有 {y.size} 个，至少需要 8 个才能做嵌套交叉验证")
+    groups_arr = None if groups is None else np.asarray(groups, dtype=object)
+    if groups_arr is not None and groups_arr.size != y.size:
+        raise bad_request(f"groups 长度 {groups_arr.size} 与样本数 {y.size} 不一致")
+    splitter, folds_used, grouped = _cv_splitter(y, groups_arr, folds, seed)
+    splits = _split_folds(splitter, X, y, groups_arr, folds_used)
+    oof = np.full(y.size, np.nan)
+    fold_aucs: list[float] = []
+    fold_thresholds: list[float] = []
+    fold_features: list[list[int]] = []
+    for train_index, test_index in splits:
+        y_train = y[train_index]
+        if np.unique(y_train).size < 2:
+            continue
+        inner_groups = groups_arr[train_index] if groups_arr is not None else None
+        inner_oof = _inner_oof_scores(X[train_index], y_train, inner_folds, n_features,
+                                      model, n_trees, groups=inner_groups, seed=seed + 1)
+        threshold = _youden_threshold(y_train, inner_oof)
+        pipe = _fit_pipeline(X[train_index], y_train, n_features=n_features,
+                             model=model, n_trees=n_trees)
+        proba = _predict_pipeline(pipe, X[test_index])
+        oof[test_index] = proba
+        fold_aucs.append(float(_auc_binary(y[test_index], proba)))
+        fold_thresholds.append(float(threshold))
+        fold_features.append([int(i) for i in pipe["picked"]])
+    finite = np.isfinite(oof)
+    auc = float(_auc_binary(y[finite], oof[finite])) if finite.any() else float("nan")
+    return {
+        "auc": auc, "folds": int(folds_used),
+        "fold_aucs": fold_aucs, "fold_thresholds": fold_thresholds,
+        "fold_features": fold_features,
+        "n_features": int(max(1, min(int(n_features), X.shape[1]))),
+        "model": str(model), "grouped": bool(grouped),
+        "n_groups": int(np.unique(groups_arr).size) if grouped else None,
+        "n_samples": int(y.size), "inner_folds": int(inner_folds),
+        "oof_proba": oof,
+    }
+
+
+def _bootstrap_optimism(X: np.ndarray, y: np.ndarray, n_boot: int, notes: list[str],
+                        warnings: list[str], groups=None, n_features: int = DEFAULT_N_FEATURES,
+                        model: str = "logit", n_trees: int = 100) -> dict:
+    """Harrell 自助法乐观度（Harrell 1996）：每次重抽样**重做全流程**（填补/标度/筛选/模型/阈值）。
+
+    有受试者 ID 时按个体整块重抽（同个体重复样本一起进出）；返回 bootstrap_grouped 与
+    n_subjects，区分 apparent（全样本表观）与 corrected（乐观度校正后）。
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=int).ravel()
+    n_boot = int(max(10, min(MAX_BOOT, int(n_boot))))
+    if np.unique(y).size < 2:
+        raise prerequisite("目标变量只有 1 个类别，无法做自助法验证")
+    groups_arr = None if groups is None else np.asarray(groups, dtype=object)
+    if groups_arr is not None and groups_arr.size != y.size:
+        groups_arr = None
+    subject_ids = np.unique(groups_arr) if groups_arr is not None else None
+    apparent_pipe = _fit_pipeline(X, y, n_features=n_features, model=model, n_trees=n_trees)
+    apparent = float(_auc_binary(y, _predict_pipeline(apparent_pipe, X)))
     rng = np.random.default_rng(SEED)
     optimism_values: list[float] = []
+    threshold_values: list[float] = []
     for _ in range(n_boot):
-        idx = rng.integers(0, y.size, y.size)
-        if np.unique(y[idx]).size < 2:
+        if subject_ids is not None:
+            drawn = rng.choice(subject_ids, size=subject_ids.size, replace=True)
+            idx = np.concatenate([np.flatnonzero(groups_arr == subject) for subject in drawn])
+        else:
+            idx = rng.integers(0, y.size, y.size)
+        if idx.size == 0 or np.unique(y[idx]).size < 2:
             continue
-        model = clone(base)
+        y_boot = y[idx]
+        # 重做全流程：先用自助样本内层 CV 取 Youden 阈值（仍然只用训练数据）
+        inner_groups = groups_arr[idx] if groups_arr is not None else None
         try:
-            with _warnings.catch_warnings():
-                _warnings.simplefilter("ignore")
-                model.fit(X[idx], y[idx])
-            auc_boot = _auc_binary(y[idx], model.predict_proba(X[idx])[:, 1])
-            auc_orig = _auc_binary(y, model.predict_proba(X)[:, 1])
-        except Exception:  # noqa: BLE001 - 单次重抽样失败不影响整体
+            inner_oof = _inner_oof_scores(X[idx], y_boot, 3, n_features, model, n_trees,
+                                          groups=inner_groups, seed=SEED + 1)
+            threshold_values.append(float(_youden_threshold(y_boot, inner_oof)))
+            pipe = _fit_pipeline(X[idx], y_boot, n_features=n_features, model=model, n_trees=n_trees)
+            auc_boot = _auc_binary(y_boot, _predict_pipeline(pipe, X[idx]))
+            auc_orig = _auc_binary(y, _predict_pipeline(pipe, X))
+        except (EngineError, ValueError):
             continue
         if np.isfinite(auc_boot) and np.isfinite(auc_orig):
             optimism_values.append(float(auc_boot - auc_orig))
     valid = len(optimism_values)
     mean_optimism = float(np.mean(optimism_values)) if valid else float("nan")
-    corrected = apparent - mean_optimism if valid else float("nan")
+    corrected = float(apparent - mean_optimism) if valid else float("nan")
     notes.append(
-        f"自助法乐观度校正（Harrell 1996）：{valid}/{n_boot} 次重抽样有效，"
-        f"表观 AUC={apparent:.3f}、乐观度={mean_optimism:.3f}、校正后 AUC={corrected:.3f}"
+        f"自助法乐观度校正（Harrell 1996）：{valid}/{n_boot} 次重抽样有效"
+        + (f"（按 {len(subject_ids)} 个受试者整块重抽）" if subject_ids is not None else "（按样本重抽）")
+        + f"，表观 AUC={apparent:.3f}、乐观度={mean_optimism:.3f}、校正后 AUC={corrected:.3f}"
     )
     if valid < n_boot * 0.5:
         warnings.append(f"只有 {valid}/{n_boot} 次自助抽样成功，校正结果不稳定")
     return {"apparent": apparent, "optimism": mean_optimism, "corrected": corrected,
-            "n_boot": n_boot, "n_valid": valid}
+            "n_boot": n_boot, "n_valid": valid, "grouped": bool(subject_ids is not None),
+            "n_subjects": int(len(subject_ids)) if subject_ids is not None else None,
+            "threshold": float(np.mean(threshold_values)) if threshold_values else None,
+            "n_features": int(max(1, min(int(n_features), X.shape[1])))}
 
 
 # ---------------------------------------------------------------------------
@@ -1409,6 +1802,7 @@ def step_biomarker(ctx, params, outdir):
     de_frame = _de_frame(ctx)  # 步骤契约 requires=["de"]：缺差异结果必须给可读前置错误
     n_features = int(params.get("n_features") or DEFAULT_N_FEATURES)
     n_features = int(max(1, min(n_features, 500)))
+    folds = int(params.get("cv_folds") or DEFAULT_CV_FOLDS)
     pool_indices, pool_mode = _candidate_pool(ctx, params, notes, warnings)
     if pool_indices.size > MAX_POOL:
         warnings.append(f"候选特征 {pool_indices.size} 个超过上限，按 |Cohen's d| 预筛到 {MAX_POOL} 个")
@@ -1447,10 +1841,19 @@ def step_biomarker(ctx, params, outdir):
     cox_frame = pd.DataFrame()
     if time_col and event_col:
         try:
-            times, events, time_col, event_col = _survival_columns(ctx, {"time_col": time_col, "event_col": event_col})
+            times, events, time_col, event_col = _survival_columns(
+                ctx, {"time_col": time_col, "event_col": event_col,
+                      "event_map": params.get("event_map"),
+                      "event_unknown": params.get("event_unknown")}, warnings)
             top_features = list(frame["feature"].head(min(len(frame), max(5, n_features))))
-            cox_frame = _cox_table(ctx, top_features, times[setup["keep"]], events[setup["keep"]],
-                                   X, notes, warnings)
+            keep_arr = np.asarray(setup["keep"], dtype=bool)
+            cox_full = keep_arr & np.isfinite(times) & np.isfinite(events) & (times > 0)
+            if int(cox_full.sum()) < 4:
+                warnings.append(f"可用生存样本只有 {int(cox_full.sum())} 个（<4），跳过单变量 Cox")
+            else:
+                cox_frame = _cox_table(ctx, top_features, times[cox_full],
+                                       events[cox_full].astype(int), X[cox_full[keep_arr]],
+                                       notes, warnings)
         except EngineError as error:
             warnings.append(f"未做 Cox 回归：{error.message}")
     elif params.get("time_col") or params.get("event_col"):
@@ -1461,13 +1864,71 @@ def step_biomarker(ctx, params, outdir):
         tables.append(table("biomarker_cox", "top 特征单变量 Cox", COX_COLUMNS,
                             cox_frame.to_dict(orient="records"), note="lifelines CoxPHFitter（不可用时内置实现）"))
 
+    # ------------------------------------------------------------------
+    # P0-2：指标拆分 —— apparent（表观，乐观）/ nested_cv（训练折内全流程）/ external（未提供）
+    # 旧实现先在全样本上做 |Cohen's d| 预筛再 CV：纯噪声 60×6000 能报 AUC≈0.9967。
+    # ------------------------------------------------------------------
+    p2_notes: list[str] = []
+    p2_warnings: list[str] = []
+    subjects, subject_col = _subject_vector(ctx, params)
+    subjects_kept = None if subjects is None else subjects[np.asarray(setup["keep"], dtype=bool)]
+    if not setup["multiclass"]:
+        try:
+            X_pool_raw, _pool_names = _matrix_subset(ctx, pool_indices, setup["keep"],
+                                                     p2_warnings, impute=False)
+            nested_model = "rf" if model in ("rf", "randomforest", "random_forest") else "logit"
+            nested_trees = int(max(50, min(int(params.get("n_trees") or 300), 150)))
+            apparent_auc = _apparent_auc(X_pool_raw, setup["y"], n_features=n_features,
+                                         model=nested_model, n_trees=nested_trees)
+            nested = nested_cv_auc(X_pool_raw, setup["y"], groups=subjects_kept, folds=folds,
+                                   seed=SEED, n_features=n_features, model=nested_model,
+                                   n_trees=nested_trees)
+            old_cv = metrics.get("cv_auc")
+            metrics["pool_cv_auc"] = (float(old_cv) if isinstance(old_cv, (int, float))
+                                      and math.isfinite(float(old_cv)) else None)
+            metrics["cv_auc"] = float(nested["auc"])
+            metrics["cv_folds"] = int(nested["folds"])
+            metrics["apparent_auc"] = float(apparent_auc)
+            metrics["nested_cv_auc"] = float(nested["auc"])
+            metrics["nested_cv_n_features"] = int(nested["n_features"])
+            metrics["nested_cv_grouped"] = bool(nested["grouped"])
+            if nested["grouped"]:
+                metrics["n_subjects"] = int(nested["n_groups"])
+            p2_notes.append(
+                f"表观 AUC={apparent_auc:.3f}（全样本拟合，乐观偏差未校正）；"
+                f"嵌套交叉验证 AUC={nested['auc']:.3f}（{nested['folds']} 折；训练折内完成"
+                f"填补/标度/Cohen's d 筛选/模型/Youden 阈值）"
+            )
+            p2_notes.append(
+                "未提供独立外部验证集：external_auc 不报告；apparent_auc 不是验证，"
+                "nested_cv_auc 才是泛化估计"
+            )
+            if nested["grouped"]:
+                p2_notes.append(f"划分与重抽按受试者「{subject_col}」整块进行（{nested['n_groups']} 个个体）")
+            else:
+                p2_warnings.append(
+                    "样本表里没有受试者/患者 ID 列（subject/patient/donor 等）：嵌套 CV 按样本划分；"
+                    "若同一样本有重复测量，请先补 ID 列，否则泛化误差会被低估"
+                )
+        except EngineError as error:
+            p2_warnings.append(f"嵌套交叉验证未完成：{error.message}")
+    else:
+        p2_notes.append("多分类任务不做二分类 AUC 的 apparent/nested 拆分；重要度表仍来自全样本模型")
+    notes.extend(p2_notes)
+    warnings.extend(p2_warnings)
+
     bullets = [
         f"模型：{model}；候选池 {len(feature_names)} 个特征（{pool_mode}），输出前 {len(frame)} 个标志物",
         f"分组：{setup['pos']} vs {setup['neg']}（{setup['basis']}），有效样本 {int(setup['keep'].sum())} 个"
         + (f"；已剔除 {setup['n_qc']} 个 QC 样本" if setup["n_qc"] else ""),
         f"top 特征：{'、'.join(str(v) for v in frame['name'].head(5).tolist() if str(v)) or '、'.join(frame['feature'].head(5))}",
     ]
-    if "cv_auc" in metrics and math.isfinite(float(metrics["cv_auc"])):
+    if "nested_cv_auc" in metrics:
+        bullets.append(
+            f"表观 AUC {float(metrics['apparent_auc']):.3f} vs 嵌套 CV AUC "
+            f"{float(metrics['nested_cv_auc']):.3f}（差值即乐观偏差；外部验证集未提供）"
+        )
+    elif "cv_auc" in metrics and math.isfinite(float(metrics["cv_auc"])):
         bullets.append(f"交叉验证 AUC = {float(metrics['cv_auc']):.3f}")
     if "n_selected" in metrics:
         bullets.append(f"LASSO 入选特征 {metrics['n_selected']} 个（best C={metrics.get('best_c', float('nan')):.3g}）")
@@ -1820,7 +2281,12 @@ def analysis_biomarker_score(ctx, params, outdir):
 
 
 def analysis_model_validation(ctx, params, outdir):
-    """自助法乐观度校正（Harrell 1996）+ 交叉验证校准曲线。"""
+    """模型验证：按患者/样本的嵌套交叉验证 + 分组自助法乐观度校正（Harrell 1996）。
+
+    P0-2 修正：不再"全样本筛特征/填补后 CV"。所有看标签的步骤（Cohen's d 筛选、Youden 阈值、
+    模型）都只在训练折内完成；自助法按受试者整块重抽并重做全流程；指标拆分为
+    apparent（表观，乐观）/ cv_auc = nested_cv（嵌套交叉验证）/ external（未提供）。
+    """
     params = dict(params or {})
     notes: list[str] = []
     warnings: list[str] = []
@@ -1828,39 +2294,83 @@ def analysis_model_validation(ctx, params, outdir):
     keep, y, pos, neg = _binary_subset(setup, params, notes)
     n_boot = int(params.get("n_boot") or 200)
     folds = int(params.get("folds") or DEFAULT_CV_FOLDS)
+    n_features = int(params.get("n_features") or DEFAULT_N_FEATURES)
+    n_features = int(max(1, min(n_features, 100)))
     pool_indices, _ = _candidate_pool(ctx, params, notes, warnings)
     if pool_indices.size > MAX_LASSO_POOL:
         pool_indices = _cap_pool(ctx, pool_indices, setup["y"], MAX_LASSO_POOL)
         warnings.append(f"候选特征过多，已按 |Cohen's d| 预筛到 {MAX_LASSO_POOL} 个")
-    X, feature_names = _matrix_subset(ctx, pool_indices, keep, warnings)
+    X_raw, feature_names = _matrix_subset(ctx, pool_indices, keep, warnings, impute=False)
     if int(y.sum()) < 3 or int((1 - y).sum()) < 3:
         raise prerequisite("正/负类样本各需至少 3 个才能做模型验证")
-    # 交叉验证预测（校准曲线 + CV AUC）
-    proba, folds_used = _oof_proba(X, y, folds, lambda: _logit_model(X, y), False)
-    cv_auc = _auc_binary(y, proba[:, 1])
-    calibration = _calibration_frame(proba[:, 1], y, n_bins=int(params.get("bins") or 5))
-    boot = _bootstrap_optimism(X, y, n_boot, notes, warnings)
+    subjects, subject_col = _subject_vector(ctx, params)
+    subjects_kept = None if subjects is None else subjects[np.asarray(keep, dtype=bool)]
+    if subjects_kept is not None:
+        notes.append(f"按受试者「{subject_col}」分组划分与整块重抽（{len(np.unique(subjects_kept))} 个个体）")
+    else:
+        warnings.append(
+            "样本表里没有受试者/患者 ID 列（subject/patient/donor 等）：嵌套 CV 按样本划分、"
+            "自助法按样本重抽；若同一样本有重复测量，泛化误差会被低估"
+        )
+
+    # 嵌套交叉验证（训练折内：填补 → 标度 → Cohen's d 筛选 → 模型 → 内层 CV Youden 阈值）
+    nested = nested_cv_auc(X_raw, y, groups=subjects_kept, folds=folds, seed=SEED,
+                           n_features=n_features, model="logit")
+    nested_auc = float(nested["auc"])
+    oof = np.asarray(nested["oof_proba"], dtype=float)
+    finite_oof = np.isfinite(oof)
+    if finite_oof.any():
+        oof = np.where(finite_oof, oof, float(np.nanmedian(oof[finite_oof])))
+    else:
+        oof = np.full(y.size, 0.5)
+    calibration = _calibration_frame(oof, y, n_bins=int(params.get("bins") or 5))
+    threshold_values = [value for value in nested.get("fold_thresholds") or [] if math.isfinite(float(value))]
+    threshold_mean = float(np.mean(threshold_values)) if threshold_values else 0.5
+
+    # 自助法：按受试者整块重抽 + 每次重做全流程
+    boot = _bootstrap_optimism(X_raw, y, n_boot, notes, warnings, groups=subjects_kept,
+                               n_features=n_features, model="logit")
     metrics = {
-        "apparent_auc": boot["apparent"], "optimism": boot["optimism"],
-        "corrected_auc": boot["corrected"], "cv_auc": cv_auc, "folds": int(folds_used),
-        "n_boot": int(boot["n_boot"]), "n_pool": len(feature_names),
+        "apparent_auc": float(boot["apparent"]),
+        "optimism": float(boot["optimism"]),
+        "corrected_auc": float(boot["corrected"]),
+        "cv_auc": nested_auc,
+        "nested_cv_auc": nested_auc,
+        "external_auc": None,
+        "folds": int(nested["folds"]),
+        "n_boot": int(boot["n_boot"]),
+        "n_boot_valid": int(boot["n_valid"]),
+        "bootstrap_grouped": bool(boot["grouped"]),
+        "n_pool": len(feature_names),
         "n_samples": int(y.size),
+        "n_features": int(nested["n_features"]),
+        "threshold_youden": threshold_mean,
     }
+    if boot["n_subjects"] is not None:
+        metrics["n_subjects"] = int(boot["n_subjects"])
     rows = [
-        {"metric": "apparent_auc", "value": boot["apparent"], "detail": "全样本模型表观 AUC"},
-        {"metric": "optimism", "value": boot["optimism"], "detail": "自助法平均乐观度（Harrell 1996）"},
-        {"metric": "corrected_auc", "value": boot["corrected"], "detail": "乐观度校正后 AUC"},
-        {"metric": "cv_auc", "value": cv_auc, "detail": f"{folds_used} 折交叉验证外推 AUC"},
+        {"metric": "apparent_auc", "value": metrics["apparent_auc"],
+         "detail": "全样本拟合的表观 AUC（乐观，不等于验证）"},
+        {"metric": "optimism", "value": metrics["optimism"],
+         "detail": "自助法平均乐观度（Harrell 1996；按受试者整块重抽）"},
+        {"metric": "corrected_auc", "value": metrics["corrected_auc"], "detail": "乐观度校正后 AUC"},
+        {"metric": "nested_cv_auc", "value": nested_auc,
+         "detail": f"{metrics['folds']} 折嵌套 CV（训练折内完成填补/标度/筛选/模型/阈值）"},
+        {"metric": "threshold_youden", "value": threshold_mean, "detail": "训练折内层 CV 的平均 Youden 阈值"},
         {"metric": "n_boot", "value": float(boot["n_boot"]), "detail": "自助重抽样次数"},
+        {"metric": "n_boot_valid", "value": float(boot["n_valid"]), "detail": "有效自助重抽样次数"},
         {"metric": "n_samples", "value": float(y.size), "detail": "有效样本数"},
     ]
+    if boot["n_subjects"] is not None:
+        rows.append({"metric": "n_subjects", "value": float(boot["n_subjects"]), "detail": "参与重抽的个体数"})
     tables = [
         table("model_validation", "模型验证指标", METRIC_COLUMNS, rows,
-              note="模型：标准化 + L2 逻辑回归；乐观度 = 自助样本内 AUC − 原样本 AUC 的均值"),
+              note="模型：标准化 + L2 逻辑回归；乐观度 = 自助样本内 AUC − 原样本 AUC 的均值；"
+                   "外部验证集未提供（external_auc 不报告）"),
         table("calibration", "校准曲线分箱", CALIBRATION_COLUMNS, calibration.to_dict(orient="records"),
-              note="按交叉验证外推预测概率分位分箱；CI 为 Wilson 95%"),
+              note="按嵌套交叉验证外推预测概率分位分箱；CI 为 Wilson 95%"),
     ]
-    figures = [_fig_calibration(calibration, cv_auc, outdir, "calibration-curve", "Calibration curve")]
+    figures = [_fig_calibration(calibration, nested_auc, outdir, "calibration-curve", "Calibration curve")]
     data_out: list[dict] = []
     try:
         path = export_csv(calibration, outdir, "calibration.csv", index=False)
@@ -1868,10 +2378,14 @@ def analysis_model_validation(ctx, params, outdir):
     except Exception as error:  # noqa: BLE001
         warnings.append(f"导出校准表失败：{error}")
     bullets = [
-        f"表观 AUC {boot['apparent']:.3f}，自助法乐观度 {boot['optimism']:.3f}，"
-        f"校正后 AUC {boot['corrected']:.3f}（Harrell 1996；{boot['n_valid']}/{boot['n_boot']} 次有效）",
-        f"{folds_used} 折交叉验证 AUC {cv_auc:.3f}；校准曲线按 5 个概率分箱",
-        "方法：内置实现（bootstrap optimism + 交叉验证校准；模型为标准化 + L2 逻辑回归）",
+        f"表观 AUC {metrics['apparent_auc']:.3f}；自助法乐观度 {metrics['optimism']:.3f}，"
+        f"校正后 AUC {metrics['corrected_auc']:.3f}（Harrell 1996；"
+        f"{metrics['n_boot_valid']}/{metrics['n_boot']} 次有效"
+        + (f"，{metrics['n_subjects']} 个受试者" if boot["n_subjects"] is not None else "") + "）",
+        f"嵌套交叉验证 AUC {nested_auc:.3f}（{metrics['folds']} 折；训练折内完成全部看标签的步骤）；"
+        f"平均 Youden 阈值 {threshold_mean:.3f}",
+        "未提供独立外部验证集：external_auc 不报告；表观 AUC 不等于外部验证",
+        "方法：内置实现（嵌套 CV + bootstrap optimism + 交叉验证校准；模型为标准化 + L2 逻辑回归）",
     ]
     store = {"biomarker": {"kind": "model_validation", "metrics": metrics,
                            "calibration": calibration, "params": params}}
@@ -1884,16 +2398,17 @@ def analysis_survival_metabolite(ctx, params, outdir):
     params = dict(params or {})
     notes: list[str] = []
     warnings: list[str] = []
-    times, events, time_col, event_col = _survival_columns(ctx, params)
+    times, events, time_col, event_col = _survival_columns(ctx, params, warnings)
     feature = _pick_feature(ctx, params, notes)
-    # 生存分析也剔除 QC 样本
-    mask = _sample_mask(ctx) & np.isfinite(times) & (times > 0)
+    # 生存分析也剔除 QC 样本；未知事件按 NA 处理（event_unknown='na' 时由 _survival_columns 置 NaN）
+    n_unknown_event = int((~np.isfinite(events)).sum())
+    mask = _sample_mask(ctx) & np.isfinite(times) & np.isfinite(events) & (times > 0)
     if int(mask.sum()) < 8:
         raise prerequisite(f"可用生存样本只有 {int(mask.sum())} 个（需要 ≥8），请检查临床表")
     values = _feature_vector(ctx, feature, mask, warnings)
     score_all = values[mask]
     times = times[mask]
-    events = np.asarray(events, dtype=int)[mask]
+    events = np.asarray(events, dtype=float)[mask].astype(int)
     if int(events.sum()) < 2:
         raise prerequisite("生存事件（event=1）少于 2 个，无法做 logrank / Cox 分析")
     center = float(np.nanmedian(score_all))
@@ -1957,6 +2472,7 @@ def analysis_survival_metabolite(ctx, params, outdir):
         "hr_low": cox.get("lo"), "hr_high": cox.get("hi"), "cox_p": cox.get("p"),
         "cutoff": cutoff, "n_samples": int(mask.sum()), "n_events": int(events.sum()),
         "n_high": int(high.sum()), "n_low": int((~high).sum()),
+        "n_unknown_event": int(n_unknown_event),
     }
     bullets = [
         f"特征 {feature} 按 {cutoff_note} 分组：High {int(high.sum())} 例 / Low {int((~high).sum())} 例",
@@ -2063,13 +2579,13 @@ def plot_km_metabolite(ctx, params, outdir):
     warnings: list[str] = []
     times, events, time_col, event_col = _survival_columns(ctx, params)
     feature = _pick_feature(ctx, params, [])
-    mask = _sample_mask(ctx) & np.isfinite(times) & (times > 0)
+    mask = _sample_mask(ctx) & np.isfinite(times) & np.isfinite(events) & (times > 0)
     if int(mask.sum()) < 8:
         raise prerequisite(f"可用生存样本只有 {int(mask.sum())} 个（需要 ≥8）")
     values = _feature_vector(ctx, feature, mask, warnings)
     score = values[mask]
     times = times[mask]
-    events = np.asarray(events, dtype=int)[mask]
+    events = np.asarray(events, dtype=float)[mask].astype(int)
     center = float(np.nanmedian(score))
     scale = float(np.nanstd(score, ddof=1)) or 1.0
     z = (score - center) / scale

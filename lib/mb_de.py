@@ -441,6 +441,131 @@ def _fc_basis(ctx, warnings: list[str]) -> str:
     return "ratio"
 
 
+_LOG_METHODS = ("log2", "log10", "ln")
+
+
+def _layer_arrays(ctx) -> dict | None:
+    """P0-1：从 ``ctx["results"]["transform"]["layers"]`` 取三层并按当前 features/samples 对齐。
+
+    返回 ``{"linear","log","model","transform","scale","features","samples"}`` 或 None（没有
+    可用的层快照 / 与当前矩阵对不上）。对齐规则：优先按快照的 features/samples 顺序重排；
+    特征或样本集合不一致（例如 transform 之后又做了特征过滤）时返回 None，由调用方回退并
+    在 warnings 里说明 —— 绝不把错位的层当未标度层用。
+    """
+    results = ctx.get("results") if hasattr(ctx, "get") else None
+    if not isinstance(results, dict):
+        return None
+    store = results.get("transform")
+    if not isinstance(store, dict):
+        return None
+    layers = store.get("layers")
+    if not isinstance(layers, dict):
+        return None
+    values = layers.get("values")
+    if not isinstance(values, dict):
+        return None
+    features = [str(f) for f in (ctx.get("features") or [])]
+    samples = [str(s) for s in (ctx.get("samples") or [])]
+    layer_features = [str(f) for f in (layers.get("features") or [])]
+    layer_samples = [str(s) for s in (layers.get("samples") or [])]
+    if not features or not samples or not layer_features or not layer_samples:
+        return None
+
+    def _positions(current: list[str], snapshot: list[str]) -> list[int] | None:
+        if current == snapshot:
+            return list(range(len(current)))
+        if len(current) != len(snapshot) or len(set(snapshot)) != len(snapshot):
+            return None
+        position = {key: i for i, key in enumerate(snapshot)}
+        if any(key not in position for key in current):
+            return None
+        return [position[key] for key in current]
+
+    row_pos = _positions(samples, layer_samples)
+    col_pos = _positions(features, layer_features)
+    if row_pos is None or col_pos is None:
+        return None
+    n, p = len(samples), len(features)
+    aligned: dict[str, np.ndarray | None] = {}
+    for key in ("linear", "log", "model"):
+        arr = values.get(key)
+        if arr is None:
+            aligned[key] = None
+            continue
+        try:
+            arr = np.asarray(arr, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if arr.ndim != 2:
+            return None
+        if arr.shape == (len(layer_samples), len(layer_features)):
+            pass
+        elif arr.shape == (len(layer_features), len(layer_samples)):
+            arr = arr.T
+        else:
+            return None
+        if row_pos != list(range(len(samples))) or col_pos != list(range(len(features))):
+            arr = arr[np.ix_(row_pos, col_pos)]
+        if arr.shape != (n, p):
+            return None
+        aligned[key] = arr
+    if aligned.get("log") is None and aligned.get("model") is None:
+        return None
+    center = layers.get("center")
+    denom = layers.get("denom")
+    try:
+        center = None if center is None else np.asarray(center, dtype=np.float64).ravel()
+        denom = None if denom is None else np.asarray(denom, dtype=np.float64).ravel()
+    except (TypeError, ValueError):
+        center = denom = None
+    if (center is not None and center.size != p) or (denom is not None and denom.size != p):
+        center = denom = None
+    return {
+        "linear": aligned.get("linear"),
+        "log": aligned.get("log"),
+        "model": aligned.get("model"),
+        "center": center,
+        "denom": denom,
+        "transform": dict(layers.get("transform") or {}),
+        "scale": dict(layers.get("scale") or {}),
+        "features": features,
+        "samples": samples,
+    }
+
+
+def _layer_value(layers: dict, key: str) -> np.ndarray | None:
+    """取某一层；预算截断导致该层没存时，从 model 层反演（model → log → linear）。
+
+    model = (transform(x) − center) / denom，因此 log（未标度变换层）= model*denom + center，
+    linear 再按 transform.method 逆变换。反演失败返回 None（调用方回退并在 warnings 说明）。
+    """
+    if not isinstance(layers, dict):
+        return None
+    arr = layers.get(key)
+    if arr is not None:
+        return np.asarray(arr, dtype=np.float64)
+    model = layers.get("model")
+    center = layers.get("center")
+    denom = layers.get("denom")
+    if model is None or center is None or denom is None:
+        return None
+    model = np.asarray(model, dtype=np.float64)
+    unscaled = model * np.asarray(denom, dtype=np.float64) + np.asarray(center, dtype=np.float64)
+    if key == "log":
+        return unscaled
+    method = str((layers.get("transform") or {}).get("method") or "none").strip().lower()
+    with np.errstate(over="ignore", invalid="ignore"):
+        if method == "log2":
+            return np.power(2.0, unscaled)
+        if method == "log10":
+            return np.power(10.0, unscaled)
+        if method == "ln":
+            return np.exp(unscaled)
+        if method == "cuberoot":
+            return np.power(unscaled, 3.0)
+    return unscaled  # method=none：log 层就是 linear 层
+
+
 def _log2fc(mean_case: np.ndarray, mean_control: np.ndarray, basis: str) -> np.ndarray:
     if basis == "log":
         return mean_case - mean_control
@@ -663,53 +788,126 @@ def _limma(A: np.ndarray, B: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
 # ---------------------------------------------------------------------------
 
 
+def _pair_columns(info: pd.DataFrame, params: dict) -> tuple[list[str], str | None]:
+    """解析配对列：``pair_col`` 支持单列名、``["subject","visit"]``、``"subject+visit"`` 复合键。
+
+    返回 (列名列表, 猜出来的列名或 None)。没给 pair_col 时按 PAIR_COL_HINTS 猜一列。
+    """
+    raw = params.get("pair_col")
+    columns: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        columns = [str(v).strip() for v in raw if str(v).strip()]
+    elif raw is not None and str(raw).strip():
+        text = str(raw).strip()
+        for sep in ("+", "&", "|", ","):
+            if sep in text:
+                columns = [part.strip() for part in text.split(sep) if part.strip()]
+                break
+        if not columns:
+            columns = [text]
+    if columns:
+        missing = [col for col in columns if col not in info.columns]
+        if missing:
+            raise bad_request(
+                f"配对列「{'、'.join(missing)}」不在样本信息里；可选列：{'、'.join(map(str, info.columns))}"
+            )
+        return columns, "+".join(columns)
+    guessed = _guess_column(info, PAIR_COL_HINTS)
+    return ([guessed] if guessed else []), guessed
+
+
+def _pair_keys(info: pd.DataFrame, columns: list[str], indices: np.ndarray, group_label: str) -> list:
+    """按 pair_col（可复合）生成每行的配对键，并校验键非空、组内唯一。
+
+    重复键会让"配对"退化成"取第一条"（旧 bug），因此直接 bad_request 而不是猜。
+    """
+    keys: list = []
+    for index in np.asarray(indices, dtype=int):
+        parts = []
+        for column in columns:
+            try:
+                value = info.iloc[int(index)][column]
+            except (KeyError, IndexError) as error:  # pragma: no cover - 列已校验
+                raise bad_request(f"读取配对列「{column}」失败：{error}") from error
+            text = "" if value is None else str(value).strip()
+            if text == "" or text.lower() in ("nan", "none", "na", "null"):
+                raise prerequisite(
+                    f"配对列「{column}」在第 {int(index) + 1} 个样本（{info.index[int(index)]}）为空；"
+                    "配对需要显式的唯一 ID"
+                )
+            parts.append(text)
+        keys.append(tuple(parts) if len(parts) > 1 else parts[0])
+    seen: dict = {}
+    duplicates: list[str] = []
+    for key, index in zip(keys, np.asarray(indices, dtype=int)):
+        if key in seen:
+            label = " + ".join(key) if isinstance(key, tuple) else str(key)
+            duplicates.append(f"{label}（样本 {seen[key]} 与 {info.index[int(index)]}）")
+        else:
+            seen[key] = str(info.index[int(index)])
+    if duplicates:
+        raise bad_request(
+            f"配对列「{' + '.join(columns)}」在{group_label}内有重复键：{'；'.join(duplicates[:5])}"
+            f"{'…' if len(duplicates) > 5 else ''}。配对键必须唯一（重复测量请用复合键，"
+            f"如 pair_col=[\"subject\", \"visit\"] 或 \"subject+visit\"）"
+        )
+    return keys
+
+
 def _paired_indices(comp: dict, params: dict, warnings: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    """构造配对下标：优先用配对列（subject/patient/...），否则按组内顺序配对。"""
+    """构造配对下标：按显式唯一 ID（pair_col，可复合）一一配对（BIO_P0_BACKLOG §4 P0-3）。
+
+    设计原则：
+      * 没有配对列 → prerequisite，**不再**按行序悄悄配对（行序不是设计信息）；
+      * 配对列在任一组内重复 → bad_request（重复键会让配对退化成"取第一条"）；
+      * 两组各有一个同名键 → 配成一对；未配对的样本不参与配对检验并给出 warning。
+    """
     info = comp["sample_info"]
-    samples = np.array(comp["samples"], dtype=object)
     case_idx = np.flatnonzero(comp["mask_case"])
     control_idx = np.flatnonzero(comp["mask_control"])
-    key = params.get("pair_col") or ""
-    pair_col = str(key).strip() if key else None
-    if pair_col and pair_col not in info.columns:
-        raise bad_request(f"配对列「{pair_col}」不在样本信息里；可选列：{'、'.join(map(str, info.columns))}")
-    if not pair_col:
-        pair_col = _guess_column(info, PAIR_COL_HINTS)
-    if pair_col:
-        try:
-            keys_case = [str(info.iloc[i][pair_col]) for i in case_idx]
-            keys_control = [str(info.iloc[i][pair_col]) for i in control_idx]
-        except Exception:  # noqa: BLE001
-            keys_case = keys_control = []
-        common: list[str] = []
-        for value in keys_case:
-            if value in keys_control and value not in common:
-                common.append(value)
-        if len(common) >= 2:
-            pairs_case, pairs_control = [], []
-            for value in common:
-                pairs_case.append(case_idx[keys_case.index(value)])
-                pairs_control.append(control_idx[keys_control.index(value)])
-            if len(common) < len(case_idx) + len(control_idx):
-                warnings.append(
-                    f"按配对列「{pair_col}」匹配到 {len(common)} 对（实验组 {len(case_idx)} 个 / "
-                    f"对照组 {len(control_idx)} 个样本），未配对的样本未参与配对检验"
-                )
-            return np.array(pairs_case, dtype=int), np.array(pairs_control, dtype=int)
+    columns, hint = _pair_columns(info, params)
+    if not columns:
         raise prerequisite(
-            f"配对分析需要可匹配的配对列（{pair_col}）且两种分组都有同一配对值；"
-            f"当前只匹配到 {len(common)} 对（至少 2 对）"
+            "配对分析需要显式的配对 ID 列（如 subject/patient/pair）：请在样本表里提供唯一配对列，"
+            "或设置参数 pair_col。没有配对信息时按行序配对会把不相关的样本当成一对"
         )
-    if case_idx.size != control_idx.size:
+    keys_case = _pair_keys(info, columns, case_idx, "实验组")
+    keys_control = _pair_keys(info, columns, control_idx, "对照组")
+    control_lookup: dict = {}
+    for key, index in zip(keys_control, control_idx):
+        control_lookup.setdefault(key, []).append(int(index))
+    pairs_case: list[int] = []
+    pairs_control: list[int] = []
+    unmatched_case: list[str] = []
+    for key, index in zip(keys_case, case_idx):
+        targets = control_lookup.get(key) or []
+        if not targets:
+            unmatched_case.append(" + ".join(key) if isinstance(key, tuple) else str(key))
+            continue
+        pairs_case.append(int(index))
+        pairs_control.append(int(targets.pop(0)))
+    matched_controls = set(pairs_control)
+    unmatched_control = [
+        " + ".join(key) if isinstance(key, tuple) else str(key)
+        for key, index in zip(keys_control, control_idx) if int(index) not in matched_controls
+    ]
+    if len(pairs_case) < 2:
         raise prerequisite(
-            f"配对分析要求两组样本数相同（实验组 {case_idx.size} / 对照组 {control_idx.size}），"
-            f"或在样本表里提供配对列（如 subject/patient）；没有配对信息时无法做配对检验"
+            f"配对列「{' + '.join(columns)}」只匹配到 {len(pairs_case)} 对（至少 2 对）："
+            f"实验组有 {len(case_idx)} 个、对照组有 {len(control_idx)} 个样本"
         )
-    warnings.append(
-        "没有找到配对列（subject/patient/pair 等）：按两组内的样本顺序一一配对，"
-        "请确认这种配对关系符合实验设计"
-    )
-    return np.sort(case_idx), np.sort(control_idx)
+    if unmatched_case or unmatched_control:
+        detail = []
+        if unmatched_case:
+            detail.append(f"实验组未配对 {len(unmatched_case)} 个（如 {unmatched_case[0]}）")
+        if unmatched_control:
+            detail.append(f"对照组未配对 {len(unmatched_control)} 个（如 {unmatched_control[0]}）")
+        warnings.append(
+            f"按配对列「{' + '.join(columns)}」匹配到 {len(pairs_case)} 对（实验组 "
+            f"{len(case_idx)} / 对照组 {len(control_idx)} 个样本）；{'；'.join(detail)}，"
+            f"这些样本未参与配对检验"
+        )
+    return np.array(pairs_case, dtype=int), np.array(pairs_control, dtype=int)
 
 
 # ---------------------------------------------------------------------------
@@ -736,19 +934,16 @@ def _de_compute(ctx, params: dict) -> dict:
     paired = _bool_param(params, "paired", False)
     fdr = _float_param(params, "fdr", 0.05, 1e-6, 1.0)
     fc = _float_param(params, "fc", 1.5, 1e-6, None)
-    basis = _fc_basis(ctx, warnings)
-
     X = comp["X"]
     features = comp["features"]
+    samples = [str(s) for s in (comp.get("samples") or ctx.get("samples") or [])]
     if paired:
         case_idx, control_idx = _paired_indices(comp, params, warnings)
-        A = X[case_idx]
-        B = X[control_idx]
     else:
         case_idx = np.flatnonzero(comp["mask_case"])
         control_idx = np.flatnonzero(comp["mask_control"])
-        A = X[case_idx]
-        B = X[control_idx]
+    A = X[case_idx]
+    B = X[control_idx]
 
     missing = int(np.isnan(A).sum() + np.isnan(B).sum())
     if missing:
@@ -778,9 +973,62 @@ def _de_compute(ctx, params: dict) -> dict:
             f"df_post={info['df_post']:.3g}）；本机未安装 limma，结果不保证与 R limma 逐位相同"
         )
 
-    log2fc = _log2fc(mean_a, mean_b, basis)
-    detected = np.isfinite(A).sum(axis=0) + np.isfinite(B).sum(axis=0)
-    detected_frac = detected.astype(float) / float(A.shape[0] + B.shape[0])
+    # P0-1：效应量（log2FC / 均值）来自「未标度层」，统计量仍在当前矩阵上算。
+    #   有 log 变换 → 未标度 log 层均值差（2 倍信号严格 = 1）；
+    #   只有 cuberoot / 无变换 → 未标度线性层均值比；
+    #   没有层快照（旧数据/跨会话丢失）→ 回退旧口径并在 warnings 说明。
+    layers = _layer_arrays(ctx)
+    if layers is not None:
+        layer_method = str((layers.get("transform") or {}).get("method") or "none").strip().lower()
+        layer_log = _layer_value(layers, "log")
+        layer_linear = _layer_value(layers, "linear") if layer_method not in _LOG_METHODS else None
+        if layer_method in _LOG_METHODS and layer_log is not None:
+            mean_a = np.nanmean(layer_log[case_idx], axis=0)
+            mean_b = np.nanmean(layer_log[control_idx], axis=0)
+            if layer_method == "log10":
+                mean_a = mean_a * math.log2(10.0)
+                mean_b = mean_b * math.log2(10.0)
+            elif layer_method == "ln":
+                mean_a = mean_a / math.log(2.0)
+                mean_b = mean_b / math.log(2.0)
+            log2fc = mean_a - mean_b
+            basis = "log"
+            log2fc_basis = "log2-mean-difference (未标度 log 层)"
+        elif layer_linear is not None:
+            linear_a = np.nanmean(layer_linear[case_idx], axis=0)
+            linear_b = np.nanmean(layer_linear[control_idx], axis=0)
+            log2fc = _log2fc(linear_a, linear_b, "ratio")
+            mean_a, mean_b, basis = linear_a, linear_b, "ratio"
+            log2fc_basis = "log2-ratio-of-means (未标度线性层)"
+        else:
+            layers = None
+    if layers is None:
+        basis = _fc_basis(ctx, warnings)
+        log2fc = _log2fc(mean_a, mean_b, basis)
+        log2fc_basis = {"log": "log2-mean-difference", "ratio": "log2-ratio-of-means",
+                        "scaled": "scaled-difference"}[basis]
+
+    # 检出比例：用 ctx["raw"]（原始未填补强度）的缺失掩码，按本次比较的样本索引统计；
+    # raw 不存在/形状不符时回退当前矩阵（并保持旧的 1.0 语义，不伪造检出率）。
+    detected_frac = None
+    raw = ctx.get("raw") if hasattr(ctx, "get") else None
+    if raw is not None:
+        try:
+            raw_arr = np.asarray(raw, dtype=np.float64)
+            if raw_arr.ndim == 2 and raw_arr.shape == (len(samples), len(features)):
+                compare_idx = np.unique(np.concatenate([case_idx, control_idx]))
+                detected = np.isfinite(raw_arr[compare_idx, :]).sum(axis=0)
+                detected_frac = detected.astype(float) / float(len(compare_idx))
+            else:
+                warnings.append(
+                    f"ctx['raw'] 形状 {getattr(raw_arr, 'shape', None)} 与当前矩阵 "
+                    f"({len(samples)}, {len(features)}) 不一致：detected_frac 回退当前矩阵（可能高估检出率）"
+                )
+        except (TypeError, ValueError):
+            detected_frac = None
+    if detected_frac is None:
+        detected = np.isfinite(A).sum(axis=0) + np.isfinite(B).sum(axis=0)
+        detected_frac = detected.astype(float) / float(A.shape[0] + B.shape[0])
     finite_p = np.isfinite(p)
     p_adj = bh_fdr(np.where(finite_p, p, np.nan))
 
@@ -825,8 +1073,7 @@ def _de_compute(ctx, params: dict) -> dict:
         "contrast": {"case": comp["case"], "control": comp["control"]},
         "fdr": fdr,
         "fc": fc,
-        "log2fc_basis": {"log": "log2-mean-difference", "ratio": "log2-ratio-of-means",
-                         "scaled": "scaled-difference"}[basis],
+        "log2fc_basis": str(log2fc_basis),
         "n_up": n_up,
         "n_down": n_down,
         "n_tested": n_tested,

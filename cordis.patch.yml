@@ -1,8 +1,9 @@
 # dsh-metabolomics bundle patch
 # 一个 Host 插件（/metabolomics HTTP 路由 + metabolomics agent 工具 + prompt section）
 # 加一个 Client 整页（main 槽 key=metabolomics，侧边栏 panellist 入口）。
-# id 与 name 必须等于包名 dsh-metabolomics：Client 模块 loader id 要与包名一致。
+# config.python：优先用装了 matchms（以及后续 ropls 桥的 R）的专用解释器。
 - insert:
     - id: dsh-metabolomics
       name: 'dsh-metabolomics'
-      config: {}
+      config:
+        python: '/Users/dingyuntao/.dsh/runtimes/bio312/bin/python'

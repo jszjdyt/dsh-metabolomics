@@ -6,11 +6,17 @@ dsh-metabolomics — PLS-DA / OPLS-DA 判别分析（mb-stat）
   ANALYSES : plsda_vip / oplsda_splot / plsda_permutation / plsda_cv / plsda_multiclass / pca_loadings
   PLOTS    : plsda_scores / oplsda_splot / vip_bar / permutation_test
 
-方法（全部 numpy 自实现；本机无 ropls / mixOmics，不冒充官方包）：
-  * PLS2（NIPALS，Wold 1966；Geladi & Kowalski 1986）：X 中心化 + Pareto/auto 标度，Y 用
+方法（PLS-DA / OPLS-DA 优先调 R 的 ropls 官方实现，缺失时回退内置 NIPALS）：
+  * **ropls（官方实现，优先）**：lib/r_ropls.R 通过 mb_rbridge 调 `ropls::opls`——PCA / PLS-DA
+    （predI=k, orthoI=0）/ OPLS-DA（predI=1, orthoI=m）；R²X/R²Y/Q²、VIP、置换检验（permI，
+    含 pR2Y/pQ2 与零分布）、p(corr) 全部来自 ropls 自己的 modelDF/summaryDF/vipVn/permMN。
+    多分组时 ropls 的 OPLS-DA 只支持二分类，按"阳性类 vs 其余"一对其余构造（显式记录）。
+  * **内置回退**（R 或 ropls 不可用时；method 字符串会写明）：
+    PLS2（NIPALS，Wold 1966；Geladi & Kowalski 1986）：X 中心化 + Pareto/auto 标度，Y 用
     one-hot 编码（两类 → 2 列；多类 → g 列），逐成分 deflation，R²X/R²Y 为累计解释率。
   * 交叉验证 Q²：分层 k 折（每折只用训练折拟合标度参数，避免信息泄漏），
-    Q² = 1 − PRESS/TSS（Wold 1978；SIMCA/ropls 语义）。
+    Q² = 1 − PRESS/TSS（Wold 1978；SIMCA/ropls 语义）。走 ropls 时 Q² 以 ropls 的
+    crossvalI 结果为准，Python 侧 k 折只负责混淆矩阵/准确率/AUC。
   * VIP（Variable Importance in Projection，Wold 1995）：
     VIP_j = sqrt( p · Σ_a SS_a·(w_ja/||w_a||)² / Σ_a SS_a )，SS_a = (t_aᵀt_a)·Σ_y q_{a,y}²；
     全部成分时 mean(VIP²) = 1。
@@ -33,11 +39,13 @@ from __future__ import annotations
 
 import math
 import os
+import time
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 
+import mb_rbridge as rb
 from mb_common import (
     PALETTE,
     EngineError,
@@ -780,9 +788,353 @@ def _resolve_method(params: dict) -> str:
     raise bad_request(f"未知的判别方法「{params.get('method')}」（可选 plsda / oplsda）")
 
 
-def _fit_model(ctx, params: dict, *, with_cv: bool = False, cv_folds=None,
-               with_permutation: bool = False, n_perms=None) -> dict:
-    """拟合 PLS-DA 或 OPLS-DA，返回统一的 model dict（含 scores/vip/metrics/cv/permutation）。"""
+# ---------------------------------------------------------------------------
+# ropls 官方实现（R 桥）——PLS-DA / OPLS-DA / PCA 的优先路径
+# ---------------------------------------------------------------------------
+
+R_SCRIPT = "r_ropls.R"
+R_TIMEOUT = 300              # 秒；mb_rbridge 内部再夹到 ≤600
+R_MAX_PERMS = 1000           # ropls 置换是 R 侧循环，超过这个量级确定性降级
+R_FALLBACK_LABEL = "回退内置 NIPALS（ropls 不可用）"
+
+
+def _impl_param(params: dict) -> str:
+    """implementation 参数：auto（默认，优先 ropls）/ ropls / builtin。"""
+    raw = str((params or {}).get("implementation") or "auto").strip().lower()
+    if raw in ("ropls", "r", "official"):
+        return "ropls"
+    if raw in ("builtin", "python", "numpy", "internal"):
+        return "builtin"
+    return "auto"
+
+
+def ropls_status() -> dict:
+    """ropls 可用性（自检/UI/方法字符串共用；永不抛异常）。"""
+    try:
+        info = rb.r_info()
+    except Exception as error:  # noqa: BLE001 - 探测失败不影响主流程
+        return {"available": False, "reason": f"R 探测失败：{error}", "rscript": None,
+                "r_version": None, "ropls_version": None}
+    return {
+        "available": bool(info.get("available")) and bool((info.get("packages") or {}).get("ropls")),
+        "rscript": info.get("script"),
+        "r_version": info.get("version"),
+        "ropls_version": info.get("ropls_version"),
+        "reason": "" if (info.get("available") and (info.get("packages") or {}).get("ropls"))
+        else rb.unavailable_reason(),
+    }
+
+
+def _r_outdir(ctx, tag: str) -> str:
+    base = str(ctx.get("outdir") or os.getcwd())
+    return os.path.join(base, "ropls", tag)
+
+
+def _r_info_frame(ctx, prep: dict) -> pd.DataFrame:
+    """样本注释 + 明确的 `_mb_group` 分组列（避免依赖 group_col 猜测）。"""
+    samples = [str(s) for s in prep["samples"]]
+    frame = _sample_info_frame(ctx, samples).copy()
+    frame.index = pd.Index(samples, name="sample")
+    labels = prep.get("labels")
+    if labels is None:
+        labels = ["NA"] * len(samples)
+    frame["_mb_group"] = [str(x) for x in labels]
+    return frame
+
+
+def _ropls_label(result_payload: dict, method: str) -> str:
+    """真实实现的方法字符串（含 n_comp / ortho 值与 ropls 版本）。"""
+    version = str(result_payload.get("ropls_version") or "").strip()
+    version_txt = f"ropls {version}" if version else "ropls"
+    if method == "oplsda":
+        ortho = int(result_payload.get("orthoI") or 0)
+        return f"ropls::opls（OPLS-DA，predI=1，orthoI={ortho}，{version_txt}）"
+    n_comp = int(result_payload.get("predI") or 0)
+    return f"ropls::opls（PLS-DA 模式，predI={n_comp}，orthoI=0，{version_txt}）"
+
+
+def _label_method(model: dict) -> str:
+    """模型真实实现的方法字符串（ropls::opls … 或 回退内置 NIPALS（ropls 不可用）…）。"""
+    label = str(model.get("impl_label") or "").strip()
+    if label:
+        return label
+    if model.get("implementation") == "ropls":
+        return "ropls::opls"
+    return R_FALLBACK_LABEL
+
+
+def _with_method(payload: dict, model: dict) -> dict:
+    """把真实实现写进结果信封（summary.method，供 UI / Agent / 审计读取）。"""
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary["method"] = _label_method(model)
+    return payload
+
+
+def _align_rows(frame: pd.DataFrame, index, what: str) -> pd.DataFrame:
+    """把 R 写回的表按样本/特征名对齐；整行缺失视为协议对不上（不静默补 0）。"""
+    target = pd.Index([str(x) for x in index])
+    if frame.index.has_duplicates:
+        frame = frame[~frame.index.duplicated(keep="first")]
+    out = frame.reindex(target)
+    if len(out) and out.isna().all(axis=1).any():
+        missing = int(out.isna().all(axis=1).sum())
+        raise EngineError("internal", f"ropls 返回的 {what} 表与数据对不上：{missing} 行缺失")
+    return out
+
+
+def _first_row(frame: pd.DataFrame, component: str) -> dict:
+    if frame is None or frame.empty:
+        return {}
+    if "component" in frame.columns and component in set(map(str, frame["component"])):
+        return frame.loc[frame["component"] == component].iloc[0].to_dict()
+    return {}
+
+
+def _num(value, default=None):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def _perm_from_ropls(perm_table: pd.DataFrame, perm_meta: dict,
+                     requested: int) -> dict | None:
+    """ropls permMN（第 1 行=观测模型，其余=打乱标签）→ 与内置实现同构的置换 dict。"""
+    if perm_table is None or len(perm_table) < 2:
+        return None
+    null = perm_table.iloc[1:]
+    r2y = pd.to_numeric(null.get("R2Y(cum)"), errors="coerce").to_numpy(dtype=float)
+    q2 = pd.to_numeric(null.get("Q2(cum)"), errors="coerce").to_numpy(dtype=float)
+    corr = pd.to_numeric(null.get("sim"), errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(r2y) & np.isfinite(q2)
+    r2y = r2y[valid]
+    q2 = q2[valid]
+    corr = corr[valid]
+
+    def _intercept(values):
+        try:
+            finite = np.isfinite(values) & np.isfinite(corr)
+            if int(finite.sum()) < 2:
+                return float("nan")
+            _slope, intercept = np.polyfit(corr[finite], values[finite], 1)
+            return float(intercept)
+        except Exception:  # noqa: BLE001
+            return float("nan")
+
+    n_perms = int(len(r2y))
+    return {
+        "n_perms": n_perms,
+        "requested": int(requested),
+        "r2y_obs": _num(perm_meta.get("r2y_obs")),
+        "q2_obs": _num(perm_meta.get("q2_obs")),
+        "r2y_null": r2y.tolist(),
+        "q2_null": q2.tolist(),
+        "corr": corr.tolist(),
+        "p_r2y": _num(perm_meta.get("p_r2y"), 1.0),
+        "p_q2": _num(perm_meta.get("p_q2"), 1.0),
+        "r2y_intercept": _intercept(r2y),
+        "q2_intercept": _intercept(q2),
+        "note": None,
+        "source": "ropls",
+    }
+
+
+def _cv_python(ctx, prep: dict, method: str, n_comp: int, n_orth: int,
+               cv_folds) -> dict:
+    """Python 侧分层 k 折：只提供混淆矩阵/准确率/AUC 与逐成分 Q²（ropls 不返回 OOF 预测）。"""
+    folds = _cv_folds(prep["labels"], int(cv_folds or 7), np.random.default_rng(SEED))
+    if method == "oplsda":
+        cv = _cv_opls(prep, n_orth, folds)
+    else:
+        cv = _cv_pls(prep, int(max(1, n_comp)), folds)
+    cv["classification"] = _classification(cv["oof"], prep["labels"], prep["groups"])
+    cv["source"] = "python-kfold"
+    return cv
+
+
+def _fit_model_ropls(ctx, params: dict, *, with_cv: bool = False, cv_folds=None,
+                     with_permutation: bool = False, n_perms=None) -> dict:
+    """调 r_ropls.R（ropls::opls）拟合，装配成与内置实现同构的 model dict。
+
+    ropls 不可用时抛 mb_rbridge.RUnavailable，由 _fit_model 决定是否回退；
+    ropls 运行期报错按 runtime 上抛（不静默换算法）。
+    """
+    method = _resolve_method(params)
+    center_scale = str(params.get("center_scale") or "auto")
+    prep = _prepare(ctx, center_scale=center_scale, group_col=params.get("group_col"))
+    n = prep["n_samples"]
+    n_comp = _int_param(params, "n_comp", 3, 1, 50)
+    if method == "oplsda":
+        orth = params.get("orth_comp")
+        n_orth = int(max(1, min(int(orth) if orth is not None else n_comp - 1, n - 2, 20)))
+        pred_i = 1
+    else:
+        n_orth = 0
+        pred_i = int(max(1, min(n_comp, n - 1, prep["n_features"])))
+
+    folds = int(max(3, min(int(cv_folds or params.get("cv_folds") or 7), n - 1)))
+    requested_perms = 0
+    perms = 0
+    if with_permutation:
+        requested_perms = int(max(1, n_perms or params.get("permutations") or 200))
+        perms = int(min(requested_perms, R_MAX_PERMS))
+
+    positive = ""
+    if method == "oplsda" and len(prep["groups"]) > 2:
+        positive = str(params.get("positive_class") or "").strip() or str(prep["groups"][0])
+
+    payload = {
+        "expr": prep["X"],
+        "features": prep["features"],
+        "samples": prep["samples"],
+        "info": _r_info_frame(ctx, prep),
+        "params": {
+            "mode": "oplsda" if method == "oplsda" else "plsda",
+            "n_comp": int(pred_i + n_orth) if method == "oplsda" else int(pred_i),
+            "orth_comp": int(n_orth),
+            "center_scale": str(prep["center_scale"]),
+            "cv_folds": int(folds),
+            "permutations": int(perms),
+            "seed": int(SEED),
+            "group_col": "_mb_group",
+            "positive_class": positive,
+        },
+    }
+    rres = rb.run_r(R_SCRIPT, payload, outdir=_r_outdir(ctx, method), timeout=R_TIMEOUT)
+    r_payload = rres.get("result") or {}
+    tables = rres.get("tables") or {}
+    scores_r = tables.get("scores")
+    loadings_r = tables.get("loadings")
+    modeldf = tables.get("modeldf")
+    if scores_r is None or loadings_r is None:
+        raise EngineError("internal", "ropls 返回缺少 scores/loadings 表")
+
+    scores_r = _align_rows(scores_r, prep["samples"], "scores")
+    loadings_r = loadings_r.reindex(pd.Index([str(f) for f in prep["features"]]))
+    for column in ("vip", "loading_p1", "p_corr1"):
+        if column not in loadings_r.columns:
+            loadings_r[column] = np.nan
+
+    vip_values = pd.to_numeric(loadings_r["vip"], errors="coerce").to_numpy(dtype=float)
+    label = _ropls_label(r_payload, method)
+    summary_r = r_payload.get("summary") or {}
+    model: dict = {
+        "method": method,
+        "prep": prep,
+        "classes": prep["groups"],
+        "labels": prep["labels"],
+        "center_scale": prep["center_scale"],
+        "scale_label": prep["scale_label"],
+        "warnings": list(prep["warnings"]),
+        "params": params,
+        "implementation": "ropls",
+        "impl_label": label,
+        "ropls": {
+            "version": r_payload.get("ropls_version"),
+            "r_version": r_payload.get("r_version"),
+            "model_type": r_payload.get("model_type"),
+            "predI": r_payload.get("predI"),
+            "orthoI": r_payload.get("orthoI"),
+            "crossvalI": r_payload.get("crossvalI"),
+            "positive_class": r_payload.get("positive_class") or None,
+            "binary": bool(r_payload.get("binary")),
+            "ms": int(rres.get("ms") or 0),
+        },
+        "vip_values": vip_values,
+    }
+
+    scores = scores_r.copy()
+    scores.index = pd.Index([str(s) for s in prep["samples"]], name="sample")
+    scores["group"] = prep["labels"]
+    model["scores"] = scores
+    model["vip"] = _vip_frame(prep, vip_values)
+    model["loadings"] = loadings_r
+
+    if method == "oplsda":
+        total_row = _first_row(modeldf, "sum")
+        pred_row = _first_row(modeldf, "p1")
+        ortho_rows = []
+        if modeldf is not None and "component" in modeldf.columns:
+            ortho_rows = [row for row in modeldf.to_dict(orient="records")
+                          if str(row.get("component", "")).startswith("o")]
+        n_orth_actual = int(r_payload.get("orthoI") or len(ortho_rows) or n_orth)
+        model["n_comp"] = int(pred_i + n_orth_actual)
+        model["n_orth"] = n_orth_actual
+        model["r2x_pred"] = _num(pred_row.get("r2x"), 0.0)
+        model["r2x_orth"] = [_num(row.get("r2x"), 0.0) for row in ortho_rows]
+        model["r2x_total"] = _num(total_row.get("r2x_cum"), _num(summary_r.get("r2x_cum"), 0.0))
+        model["r2x_cum"] = float(model["r2x_total"] or 0.0)
+        model["r2y_cum"] = float(_num(summary_r.get("r2y_cum"), 0.0) or 0.0)
+        model["r2y_pred"] = float(_num(pred_row.get("r2y_cum"), 0.0) or 0.0)
+        model["q2_cum"] = _num(summary_r.get("q2_cum"))
+        model["q2"] = [model["q2_cum"]] if model["q2_cum"] is not None else []
+        model["r2y"] = [model["r2y_cum"]]
+        model["r2x"] = [model["r2x_total"]]
+        p1 = pd.to_numeric(loadings_r["loading_p1"], errors="coerce").to_numpy(dtype=float)
+        p_corr = pd.to_numeric(loadings_r["p_corr1"], errors="coerce").to_numpy(dtype=float)
+        model["splot"] = _splot_frame(prep, {"p_pred": p1, "p_corr": p_corr, "vip": vip_values})
+        model["p_corr"] = p_corr.tolist()
+        model["p_pred"] = p1.tolist()
+    else:
+        model["n_comp"] = int(r_payload.get("n_comp") or pred_i)
+        model["n_orth"] = 0
+        model["r2x_cum"] = float(_num(summary_r.get("r2x_cum"), 0.0) or 0.0)
+        model["r2y_cum"] = float(_num(summary_r.get("r2y_cum"), 0.0) or 0.0)
+        model["q2_cum"] = _num(summary_r.get("q2_cum"))
+        r2x_list: list[float] = []
+        r2y_list: list[float] = []
+        q2_list: list[float] = []
+        if modeldf is not None and len(modeldf):
+            pred_rows = [row for row in modeldf.to_dict(orient="records")
+                         if str(row.get("component", "")).startswith("p")]
+            for row in pred_rows:
+                r2x_list.append(_num(row.get("r2x_cum"), 0.0))
+                r2y_list.append(_num(row.get("r2y_cum"), 0.0))
+                q2_value = _num(row.get("q2_cum"))
+                if q2_value is not None:
+                    q2_list.append(q2_value)
+        model["r2x"] = r2x_list or [model["r2x_cum"]]
+        model["r2y"] = r2y_list or [model["r2y_cum"]]
+        model["q2"] = q2_list or ([model["q2_cum"]] if model["q2_cum"] is not None else [])
+        model["splot"] = None
+        loading_cols = [c for c in loadings_r.columns if str(c).startswith("loading_p")]
+        p_columns = loadings_r[loading_cols].apply(pd.to_numeric, errors="coerce")
+        corr_columns = loadings_r[[c for c in loadings_r.columns if str(c).startswith("p_corr")]]
+        model["p_pred"] = p_columns.iloc[:, 0].to_numpy(dtype=float) if loading_cols else None
+        model["p_corr"] = (corr_columns.iloc[:, 0].to_numpy(dtype=float)
+                           if len(corr_columns.columns) else None)
+
+    perm = _perm_from_ropls(tables.get("perm"), r_payload.get("perm") or {}, requested_perms)
+    if perm is not None:
+        model["permutation"] = perm
+    if with_cv:
+        model["cv"] = _cv_python(ctx, prep, method, model["n_comp"], model.get("n_orth") or 0,
+                                 folds)
+    if perms and perm is None:
+        model["warnings"].append("ropls 没有返回置换零分布（permI=0 或响应不是单列），置换检验未运行")
+    if requested_perms > perms:
+        model["warnings"].append(
+            f"ropls 置换次数从 {requested_perms} 降到 {perms}（R 侧置换循环的确定性上限）")
+    # R 侧 warnings/notes 全部上抛（含"多分类按一对其余"这类必须让用户看到的说明）
+    for text in list(rres.get("warnings") or []) + list(r_payload.get("notes") or []):
+        text = str(text).strip()
+        if text and text not in model["warnings"]:
+            model["warnings"].append(text)
+    _attach_metrics(model)
+    model["metrics"]["implementation"] = label
+    model["metrics"]["ropls_version"] = r_payload.get("ropls_version")
+    if method == "oplsda":
+        model["metrics"]["binary"] = bool(r_payload.get("binary"))
+        model["metrics"]["positive_class"] = r_payload.get("positive_class") or None
+        model["metrics"]["r2y_pred"] = model.get("r2y_pred")
+    return model
+
+
+def _fit_model_builtin(ctx, params: dict, *, with_cv: bool = False, cv_folds=None,
+                       with_permutation: bool = False, n_perms=None) -> dict:
+    """内置 NIPALS 实现（ropls 不可用时的回退路径）。"""
     params = _base_params(ctx, params)
     method = _resolve_method(params)
     center_scale = str(params.get("center_scale") or "auto")
@@ -866,6 +1218,42 @@ def _fit_model(ctx, params: dict, *, with_cv: bool = False, cv_folds=None,
                 np.random.default_rng(SEED)), int(n_perms or params.get("permutations") or 200))
 
     _attach_metrics(model)
+    model["implementation"] = "builtin"
+    model["impl_label"] = str(model.get("fallback_label") or R_FALLBACK_LABEL)
+    model["metrics"]["implementation"] = model["impl_label"]
+    return model
+
+
+def _fit_model(ctx, params: dict, *, with_cv: bool = False, cv_folds=None,
+               with_permutation: bool = False, n_perms=None) -> dict:
+    """拟合 PLS-DA / OPLS-DA：优先 ropls 官方实现，R/ropls 不可用时回退内置 NIPALS。
+
+    method 字符串始终反映真实实现（ropls::opls … 或 回退内置 NIPALS（ropls 不可用）…）。
+    ropls 运行期报错（runtime/prerequisite/timeout）**不**回退——不静默换统计方法。
+    """
+    params = _base_params(ctx, params)
+    impl = _impl_param(params)
+    fallback_reason = ""
+    if impl in ("auto", "ropls"):
+        try:
+            return _fit_model_ropls(ctx, params, with_cv=with_cv, cv_folds=cv_folds,
+                                    with_permutation=with_permutation, n_perms=n_perms)
+        except rb.RUnavailable as error:
+            if impl == "ropls":
+                raise EngineError("unsupported",
+                                  f"ropls 官方实现不可用（implementation=ropls）：{error.message}")
+            fallback_reason = error.message
+        except EngineError as error:
+            # prerequisite / runtime / timeout / internal 一律上抛，不允许静默改方法
+            raise
+    elif impl == "builtin":
+        fallback_reason = "参数显式指定 implementation=builtin"
+    model = _fit_model_builtin(ctx, params, with_cv=with_cv, cv_folds=cv_folds,
+                               with_permutation=with_permutation, n_perms=n_perms)
+    if fallback_reason:
+        model["fallback_label"] = f"{R_FALLBACK_LABEL}—{fallback_reason}"
+        model["impl_label"] = model["fallback_label"]
+        model["metrics"]["implementation"] = model["impl_label"]
     return model
 
 
@@ -1086,10 +1474,18 @@ def _cached_model(ctx, params: dict) -> dict | None:
         "classes": list(store.get("classes") or []),
         "metrics": dict(store.get("metrics") or {}),
         "n_comp": int(store.get("n_comp") or 0),
+        "n_orth": int(store.get("n_orth") or 0),
         "center_scale": store.get("center_scale") or "auto",
         "params": dict(params or {}),
         "warnings": [],
         "from_cache": True,
+        # 缓存复用也要保留"真实实现"标记，否则再次出图/分析会误标成内置实现
+        "impl_label": str(store.get("implementation") or ""),
+        "implementation": ("ropls"
+                           if str(store.get("implementation") or "").startswith("ropls")
+                           else "builtin"),
+        "ropls": store.get("ropls"),
+        "loadings": store.get("loadings") if isinstance(store.get("loadings"), pd.DataFrame) else None,
     }
     model["prep"] = {"groups": model["classes"], "features": list(vip["feature"]),
                      "samples": samples, "n_samples": len(samples),
@@ -1408,6 +1804,7 @@ def _summary_bullets(model: dict) -> list[str]:
     metrics = model.get("metrics") or {}
     method = "OPLS-DA" if model["method"] == "oplsda" else "PLS-DA"
     bullets = [
+        f"实现：{_label_method(model)}",
         f"{method}：{prep['n_samples']} 样本 × {prep['n_features']} 特征，"
         f"{model.get('n_comp')} 个成分（{model.get('scale_label')}，分组列 {prep.get('group_key') or '—'}）",
         f"R²X(cum)={metrics.get('r2x', 0.0):.3f}，R²Y(cum)={metrics.get('r2y', 0.0):.3f}，"
@@ -1531,6 +1928,12 @@ def step_plsda(ctx, params=None, outdir=None):
             "splot": model.get("splot"),
             "permutation": perm,
             "cv": model.get("cv"),
+            # 结果结构新增（只增不改）：loadings 表 / 置换 p 值 / 真实实现标记
+            "loadings": model.get("loadings"),
+            "perm_p": ({"r2y": perm.get("p_r2y"), "q2": perm.get("p_q2"),
+                        "n_perms": perm.get("n_perms")} if isinstance(perm, dict) else None),
+            "implementation": _label_method(model),
+            "ropls": model.get("ropls"),
             "opls": ({"n_orth": model.get("n_orth"), "r2x_pred": model.get("r2x_pred"),
                       "r2x_orth": model.get("r2x_orth"), "r2y": model.get("r2y_cum"),
                       "p_corr": model.get("p_corr"), "p1": model.get("p_pred")}
@@ -1563,13 +1966,14 @@ def step_plsda(ctx, params=None, outdir=None):
         tables=tables,
         figures=figures,
         warnings=warnings,
-        notes=[f"用时 {timer.ms} ms；全部为 numpy 内置实现（本机无 ropls/mixOmics），"
-               f"结果不保证与官方包逐位相同"],
+        notes=[f"用时 {timer.ms} ms；实现：{_label_method(model)}（method 字段写明真实实现，"
+               f"ropls 不可用时才回退内置 NIPALS）"],
         data_out=data_out,
     )
     # store 在 result() 之后挂上：DataFrame 必须留在内存里（不能经过 jsonable），
     # registry._apply_result 会把它写进 dataset.results，下游模块与分析直接复用。
     payload["store"] = store
+    _with_method(payload, model)
     return payload
 
 
@@ -1621,19 +2025,22 @@ def analysis_plsda_vip(ctx, params=None, outdir=None):
     n_above = int(vip["above_threshold"].sum())
     figure = _render_vip(model, {"top_n": top_n, "threshold": threshold}, outdir)
     top = vip.head(top_n)
-    return result(
+    payload = result(
         title="变量投影重要度（VIP）",
-        bullets=[f"VIP 阈值 {threshold:g}：{n_above} 个特征达到阈值（共 {len(vip)} 个）",
+        bullets=[f"实现：{_label_method(model)}",
+                 f"VIP 阈值 {threshold:g}：{n_above} 个特征达到阈值（共 {len(vip)} 个）",
                  f"VIP 最高的 5 个特征：{'、'.join(map(str, top['feature'].head(5)))}",
                  "VIP 由 PLS-DA/OPLS-DA 模型计算（Wold 1995），VIP 高不等于统计显著，需结合差异分析"],
         metrics={"n_features": int(len(vip)), "threshold": threshold, "n_above": n_above,
-                 "method": model.get("method")},
+                 "model_type": model.get("method"),
+                 "implementation": _label_method(model)},
         tables=[table("vip", f"VIP Top {len(top)}", VIP_COLUMNS,
                       rows=top.to_dict(orient="records"))],
         figures=[figure],
         warnings=list(model.get("warnings") or []),
         notes=[f"用时 {timer.ms} ms"],
     )
+    return _with_method(payload, model)
 
 
 def analysis_oplsda_splot(ctx, params=None, outdir=None):
@@ -1649,22 +2056,25 @@ def analysis_oplsda_splot(ctx, params=None, outdir=None):
     figure = _render_splot(model, {"top_n": top_n}, outdir)
     top = splot.head(top_n)
     bullets = [
+        f"实现：{_label_method(model)}",
         f"OPLS-DA：1 个预测成分 + {model.get('n_orth')} 个正交成分；"
         f"R²X 预测部分 {model.get('r2x_pred', 0.0):.3f}，R²Y {model.get('r2y_cum', 0.0):.3f}",
         f"p(corr) 绝对值最高的特征：{'、'.join(map(str, top['feature'].head(5)))}",
         "S-plot 右上/左下（高 |p1| + 高 |p(corr)|）是候选判别标志物（Bylesjö 2006）",
     ]
-    return result(
+    payload = result(
         title="OPLS-DA S-plot",
         bullets=bullets,
         metrics={"n_features": int(len(splot)), "n_orth": int(model.get("n_orth") or 0),
-                 "r2x_pred": model.get("r2x_pred"), "r2y": model.get("r2y_cum")},
+                 "r2x_pred": model.get("r2x_pred"), "r2y": model.get("r2y_cum"),
+                 "implementation": _label_method(model)},
         tables=[table("splot", f"S-plot Top {len(top)}", SPLOT_COLUMNS,
                       rows=top.to_dict(orient="records"))],
         figures=[figure],
         warnings=list(model.get("warnings") or []),
         notes=[f"用时 {timer.ms} ms"],
     )
+    return _with_method(payload, model)
 
 
 def analysis_plsda_permutation(ctx, params=None, outdir=None):
@@ -1678,6 +2088,7 @@ def analysis_plsda_permutation(ctx, params=None, outdir=None):
     frame = _perm_frame(perm)
     figure = _render_permutation(model, params, outdir)
     bullets = [
+        f"实现：{_label_method(model)}",
         f"置换 {perm.get('n_perms')} 次（请求 {perm.get('requested')} 次）："
         f"R²Y 经验 p={perm.get('p_r2y', 1.0):.4g}，Q² 经验 p={perm.get('p_q2', 1.0):.4g}",
         f"置换图回归截距：R²Y={_fmt(perm.get('r2y_intercept'))}，Q²={_fmt(perm.get('q2_intercept'))}"
@@ -1687,11 +2098,13 @@ def analysis_plsda_permutation(ctx, params=None, outdir=None):
     warnings = list(model.get("warnings") or [])
     if perm.get("note"):
         warnings.append(perm["note"])
-    return result(
+    payload = result(
         title="PLS-DA 置换检验",
         bullets=bullets,
-        metrics={k: perm.get(k) for k in ("n_perms", "requested", "r2y_obs", "q2_obs",
-                                          "p_r2y", "p_q2", "r2y_intercept", "q2_intercept")},
+        metrics={**{k: perm.get(k) for k in ("n_perms", "requested", "r2y_obs", "q2_obs",
+                                             "p_r2y", "p_q2", "r2y_intercept", "q2_intercept")},
+                 "implementation": _label_method(model),
+                 "perm_source": perm.get("source") or "builtin"},
         tables=[table("permutation", "置换检验零分布",
                       columns=[{"key": "perm", "label": "置换序号", "type": "number"},
                                {"key": "r2y_null", "label": "R²Y(null)", "type": "number"},
@@ -1702,6 +2115,7 @@ def analysis_plsda_permutation(ctx, params=None, outdir=None):
         warnings=list(dict.fromkeys(warnings)),
         notes=[f"用时 {timer.ms} ms"],
     )
+    return _with_method(payload, model)
 
 
 def _fmt(value) -> str:
@@ -1739,11 +2153,13 @@ def analysis_plsda_cv(ctx, params=None, outdir=None):
     accuracy = cls.get("accuracy")
     auc = cls.get("auc")
     bullets = [
+        f"实现：{_label_method(model)}",
         f"{folds} 折交叉验证：准确率 {_fmt(accuracy)}" + (f"，AUC {_fmt(auc)}" if auc is not None else ""),
-        f"模型 Q²(cum)={_fmt(model.get('q2_cum'))}（k 折交叉验证 PRESS/TSS）",
+        f"模型 Q²(cum)={_fmt(model.get('q2_cum'))}（ropls crossvalI 与 Python 分层 k 折各自给出；"
+        f"混淆矩阵来自 Python 分层 k 折）",
         "混淆矩阵对角线为正确判别数；准确率明显高于 1/组数 才说明判别有效",
     ]
-    return result(
+    payload = result(
         title="交叉验证与混淆矩阵",
         bullets=bullets,
         metrics={"folds": folds, "accuracy": accuracy, "auc": auc,
@@ -1763,6 +2179,7 @@ def analysis_plsda_cv(ctx, params=None, outdir=None):
         warnings=list(model.get("warnings") or []),
         notes=[f"用时 {timer.ms} ms"],
     )
+    return _with_method(payload, model)
 
 
 def analysis_plsda_multiclass(ctx, params=None, outdir=None):
@@ -1850,11 +2267,12 @@ def analysis_plsda_multiclass(ctx, params=None, outdir=None):
     figure = _render_scores(model, params, outdir)
     vip_figure = _render_vip(model, params, outdir)
     bullets = [
+        f"实现：{_label_method(model)}",
         f"多类 PLS-DA（one-hot PLS2，{n_comp} 成分）：{len(groups)} 个分组（{'、'.join(classes_idx)}）",
         f"交叉验证准确率 {_fmt(cls.get('accuracy'))}，多类 AUC(macro OVR) {_fmt(cls.get('auc'))}",
         f"综合 VIP（各类别 VIP 的均方根）最高的特征：{'、'.join(map(str, top['feature'].head(5)))}",
     ]
-    return result(
+    payload = result(
         title="多组判别（多类 PLS-DA）",
         bullets=bullets,
         metrics={"n_groups": len(groups), "n_comp": n_comp,
@@ -1880,17 +2298,11 @@ def analysis_plsda_multiclass(ctx, params=None, outdir=None):
         warnings=list(dict.fromkeys(warnings)),
         notes=[f"用时 {timer.ms} ms"],
     )
+    return _with_method(payload, model)
 
 
-def analysis_pca_loadings(ctx, params=None, outdir=None):
-    """PCA 载荷与贡献：SVD + 载荷表 + 贡献条形图（Wold 1994）。"""
-    timer = Timer()
-    params = _pdict(params)
-    outdir = outdir or ctx.get("outdir") or os.getcwd()
-    pc = _int_param(params, "pc", 1, 1, 10000)
-    top_n = _int_param(params, "top_n", 20, 1, 200)
-    prep = _prepare(ctx, center_scale=str(params.get("center_scale") or "auto"),
-                    require_groups=False)
+def _pca_svd(prep: dict, pc: int) -> dict:
+    """内置 PCA（SVD）：返回 {loadings, ratio, label}。"""
     try:
         _u, s, vt = np.linalg.svd(prep["Xp"], full_matrices=False)
     except np.linalg.LinAlgError as error:
@@ -1901,7 +2313,86 @@ def analysis_pca_loadings(ctx, params=None, outdir=None):
     ratio = var / max(float(var.sum()), 1e-18)
     if pc > vt.shape[0]:
         raise prerequisite(f"只有 {vt.shape[0]} 个主成分，无法取第 {pc} 个（请减小 pc）")
-    loadings = np.asarray(vt[pc - 1], dtype=float)
+    return {"loadings": np.asarray(vt[pc - 1], dtype=float), "ratio": ratio,
+            "label": "内置 SVD 实现（ropls 不可用）"}
+
+
+def _pca_ropls(ctx, params: dict, prep: dict, pc: int) -> dict:
+    """ropls 官方 PCA（ropls::opls，y=NULL）：返回 {loadings, ratio, label}。
+
+    ropls 不可用抛 mb_rbridge.RUnavailable；运行期错误按 runtime 上抛（不静默换算法）。
+    """
+    n_comp = int(max(int(pc), 5))
+    payload = {
+        "expr": prep["X"],
+        "features": prep["features"],
+        "samples": prep["samples"],
+        "info": _r_info_frame(ctx, prep),
+        "params": {
+            "mode": "pca",
+            "n_comp": n_comp,
+            "orth_comp": 0,
+            "center_scale": str(prep["center_scale"]),
+            "cv_folds": 7,
+            "permutations": 0,
+            "seed": int(SEED),
+            "group_col": "_mb_group",
+        },
+    }
+    rres = rb.run_r(R_SCRIPT, payload, outdir=_r_outdir(ctx, "pca"), timeout=R_TIMEOUT)
+    r_payload = rres.get("result") or {}
+    tables = rres.get("tables") or {}
+    loadings_r = tables.get("loadings")
+    pca_var = r_payload.get("pca_var") or []
+    total = _num(r_payload.get("pca_total_var"))
+    if loadings_r is None or not pca_var or not total:
+        raise EngineError("internal", "ropls 的 PCA 返回缺少 pca_var/loadings")
+    ratio = np.asarray([_num(v, 0.0) for v in pca_var], dtype=float) / max(float(total), 1e-18)
+    if pc > len(ratio):
+        raise prerequisite(f"只有 {len(ratio)} 个主成分，无法取第 {pc} 个（请减小 pc）")
+    column = f"loading_p{pc}"
+    if column not in loadings_r.columns:
+        raise EngineError("internal", f"ropls 的 PCA 返回缺少 {column} 列")
+    aligned = loadings_r.reindex(pd.Index([str(f) for f in prep["features"]]))
+    loadings = pd.to_numeric(aligned[column], errors="coerce").to_numpy(dtype=float)
+    loadings = np.where(np.isfinite(loadings), loadings, 0.0)
+    version = str(r_payload.get("ropls_version") or "").strip()
+    label = f"ropls::opls（PCA 模式，predI={int(r_payload.get('predI') or n_comp)}，ropls {version}）"
+    return {"loadings": loadings, "ratio": ratio, "label": label,
+            "ropls_version": r_payload.get("ropls_version")}
+
+
+def analysis_pca_loadings(ctx, params=None, outdir=None):
+    """PCA 载荷与贡献：优先 ropls 官方 PCA，回退内置 SVD（Wold 1994）。
+
+    载荷表与贡献率两种实现同构：contribution_pct = 载荷² / Σ载荷² × 100，
+    explained_variance = 该主成分方差 / 全部主成分方差。
+    """
+    timer = Timer()
+    params = _pdict(params)
+    outdir = outdir or ctx.get("outdir") or os.getcwd()
+    pc = _int_param(params, "pc", 1, 1, 10000)
+    top_n = _int_param(params, "top_n", 20, 1, 200)
+    prep = _prepare(ctx, center_scale=str(params.get("center_scale") or "auto"),
+                    require_groups=False)
+    impl = _impl_param(params)
+    result_block = None
+    model: dict = {}
+    if impl in ("auto", "ropls"):
+        try:
+            result_block = _pca_ropls(ctx, params, prep, pc)
+            model = {"impl_label": str(result_block.get("label") or "ropls::opls（PCA 模式）")}
+        except rb.RUnavailable as error:
+            if impl == "ropls":
+                raise EngineError("unsupported",
+                                  f"ropls 官方实现不可用（implementation=ropls）：{error.message}")
+            model = {"impl_label": f"内置 SVD 实现（ropls 不可用）—{error.message}"}
+    if result_block is None:
+        result_block = _pca_svd(prep, pc)
+        if not model:
+            model = {"impl_label": str(result_block.get("label") or "内置 SVD 实现")}
+    loadings = np.asarray(result_block["loadings"], dtype=float)
+    ratio = np.asarray(result_block["ratio"], dtype=float)
     contribution = (loadings ** 2) / max(float(np.sum(loadings ** 2)), 1e-18) * 100.0
     frame = prep["feature_meta"].copy()
     frame["loading"] = loadings
@@ -1931,7 +2422,7 @@ def analysis_pca_loadings(ctx, params=None, outdir=None):
     ax.grid(axis="y", visible=False)
     figure = _save(fig, outdir, "pca-loadings", params, pc=pc,
                    explained_variance=float(ratio[pc - 1]))
-    return result(
+    payload = result(
         title=f"PCA 载荷与贡献（PC{pc}）",
         bullets=[f"PC{pc} 解释方差 {ratio[pc - 1]:.1%}（前 {min(5, len(ratio))} 个主成分累计 {ratio[:5].sum():.1%}）",
                  f"|载荷| 最大的 5 个特征：{'、'.join(map(str, out['feature'].head(5)))}",
@@ -1950,8 +2441,9 @@ def analysis_pca_loadings(ctx, params=None, outdir=None):
                       rows=head.iloc[::-1].to_dict(orient="records"))],
         figures=[figure],
         warnings=list(prep["warnings"]),
-        notes=[f"用时 {timer.ms} ms"],
+        notes=[f"用时 {timer.ms} ms；实现：{_label_method(model)}"],
     )
+    return _with_method(payload, model)
 
 
 # ---------------------------------------------------------------------------
@@ -1993,7 +2485,7 @@ ANALYSES = [
         "id": "plsda_vip",
         "title": "变量投影重要度（VIP）",
         "group": "多变量判别",
-        "method": "VIP（Wold 1995；NIPALS 内置实现，非 ropls）",
+        "method": "VIP（Wold 1995；ropls::opls 的 vipVn；ropls 不可用时回退内置 NIPALS）",
         "needs": ["plsda"],
         "params": [
             {"key": "top_n", "label": "Top N", "type": "number", "default": 30},
@@ -2006,7 +2498,7 @@ ANALYSES = [
         "id": "oplsda_splot",
         "title": "OPLS-DA S-plot",
         "group": "多变量判别",
-        "method": "OPLS（Trygg & Wold 2002；Bylesjö 2006 S-plot；内置实现）",
+        "method": "OPLS-DA S-plot（Trygg & Wold 2002；Bylesjö 2006；ropls::opls 的 p1/p(corr)，不可用时回退内置）",
         "needs": ["plsda"],
         "params": [
             {"key": "top_n", "label": "标注特征数", "type": "number", "default": 20},
@@ -2018,7 +2510,7 @@ ANALYSES = [
         "id": "plsda_permutation",
         "title": "PLS-DA 置换检验",
         "group": "多变量判别",
-        "method": "标签置换 + R²Y/Q² 零分布（Westerhuis 2008；内置实现）",
+        "method": "标签置换 + R²Y/Q² 零分布（Westerhuis 2008；ropls permI 的 pR2Y/pQ2 与零分布，不可用时回退内置）",
         "needs": ["plsda"],
         "params": [
             {"key": "n_perms", "label": "置换次数", "type": "number", "default": 200},
@@ -2030,7 +2522,7 @@ ANALYSES = [
         "id": "plsda_cv",
         "title": "交叉验证与混淆矩阵",
         "group": "多变量判别",
-        "method": "分层 k 折交叉验证 + 混淆矩阵 + AUC（Brindle 2002 判别思路）",
+        "method": "分层 k 折 + 混淆矩阵 + AUC（Brindle 2002；Python 分层 k 折，模型 Q² 来自 ropls crossvalI）",
         "needs": ["plsda"],
         "params": [
             {"key": "folds", "label": "折数", "type": "number", "default": 7},
@@ -2042,7 +2534,7 @@ ANALYSES = [
         "id": "plsda_multiclass",
         "title": "多组判别",
         "group": "多变量判别",
-        "method": "多类 PLS-DA（one-hot PLS2 + 一对其余 VIP/AUC）",
+        "method": "多类 PLS-DA（ropls::opls 多类 PLS2；一类对其余 VIP/AUC）",
         "needs": ["groups"],
         "params": [
             {"key": "n_comp", "label": "成分数", "type": "number", "default": 3},
@@ -2055,7 +2547,7 @@ ANALYSES = [
         "id": "pca_loadings",
         "title": "PCA 载荷与贡献",
         "group": "多变量判别",
-        "method": "PCA（SVD）+ 载荷与贡献（Wold 1994；内置实现）",
+        "method": "PCA 载荷与贡献（Wold 1994；ropls::opls PCA 优先，不可用时回退内置 SVD）",
         "needs": ["transform"],
         "params": [
             {"key": "pc", "label": "主成分", "type": "number", "default": 1},
