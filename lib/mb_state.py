@@ -644,6 +644,71 @@ class Dataset:
             return np.array(["all"] * self.n_samples)
         return self.sample_info[self.group_key].astype(str).values
 
+    # -- 口径卡所需的「设计真相」 -----------------------------------------
+    # 统计口径卡要回答「每组几个样本、有没有供体/批次/QC」：这里只从样本表搬真实值，
+    # 找不到列就返回 None（口径侧写 null 并进 caveats），不猜列、不补默认值。
+    def group_counts(self) -> dict:
+        """每组样本数（口径卡/审计用；无分组列时返回空 dict）。"""
+        if not self.group_key or self.group_key not in self.sample_info.columns:
+            return {}
+        counts: dict[str, int] = {}
+        for value in self.sample_info[self.group_key].astype(str).tolist():
+            if value in ("nan", "None", "", "<NA>"):
+                continue
+            counts[str(value)] = counts.get(str(value), 0) + 1
+        return counts
+
+    def _find_sample_column(self, candidates) -> str | None:
+        """按小写列名找样本表列（列名大小写不敏感）；找不到返回 None。"""
+        index = {str(column).strip().lower(): str(column) for column in self.sample_info.columns}
+        for candidate in candidates:
+            found = index.get(candidate)
+            if found:
+                return found
+        return None
+
+    def donor_key(self) -> str | None:
+        """供体/受试者列名（口径卡判断「生物学重复」）；找不到返回 None。"""
+        return self._find_sample_column((
+            "donor", "donor_id", "patient", "patient_id", "subject", "subject_id",
+            "participant", "participant_id", "volunteer", "animal", "mouse_id",
+        ))
+
+    def n_donors(self) -> int | None:
+        key = self.donor_key()
+        if not key:
+            return None
+        values = [
+            str(value) for value in self.sample_info[key].tolist()
+            if str(value) not in ("nan", "None", "", "<NA>")
+        ]
+        return len(dict.fromkeys(values)) if values else None
+
+    def batch_key(self) -> str | None:
+        """批次/板号列名（口径卡判断「能否/是否做过批次校正」）；找不到返回 None。"""
+        return self._find_sample_column((
+            "batch", "batch_id", "batchid", "plate", "plate_id", "plateid",
+            "block", "injection_batch", "analysis_batch",
+        ))
+
+    def qc_sample_count(self) -> int | None:
+        """QC 样本数：优先取最近一次 qc 结果的 qc_mask，其次样本表的 qc 标记列；都没有返回 None。"""
+        store = self.results.get("qc") if isinstance(self.results, dict) else None
+        mask = store.get("qc_mask") if isinstance(store, dict) else None
+        if isinstance(mask, (list, tuple)):
+            return int(sum(1 for value in mask if bool(value)))
+        for column in ("qc", "is_qc", "qc_flag", "qc_sample"):
+            if column not in self.sample_info.columns:
+                continue
+            try:
+                flags = self.sample_info[column].astype(str).str.strip().str.lower()
+            except Exception:  # noqa: BLE001
+                continue
+            truthy = flags.isin(("1", "true", "yes", "y", "qc"))
+            if bool(truthy.any()):
+                return int(truthy.sum())
+        return None
+
     def _guess_group(self) -> str | None:
         """自动挑一个像分组的列（2–20 组、非批次/QC/时间/临床列）。"""
         if self.sample_info is None or self.sample_info.empty:
@@ -748,8 +813,19 @@ class Dataset:
             "n_features": self.n_features,
             "species": self.species,
             "polarity": self.polarity,
+            # 矩阵当前值类型（raw 峰强度 / lognorm / scaled）：口径卡判断「在哪一层算」。
+            "value_kind": str(self.X_kind or ""),
             "feature_meta": self.feature_meta(),
             "sample_columns": self.sample_columns(),
+            # 设计真相（分组/供体/批次/QC）：口径卡直接搬这些字段，取不到写 null。
+            "group_key": self.group_key,
+            "groups": list(self.groups or []),
+            "group_counts": self.group_counts(),
+            "donor_key": self.donor_key(),
+            "n_donors": self.n_donors(),
+            "batch_key": self.batch_key(),
+            "n_qc": self.qc_sample_count(),
+            "created_at": self.created_at,
             "steps": list(self.steps),
             "current": self.current,
             "warnings": list(self.warnings),

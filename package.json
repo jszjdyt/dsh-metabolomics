@@ -54,5 +54,16 @@
     "pathway-enrichment",
     "biomarker"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "ci": {
+    "node": [
+      "test/client-logic.test.mjs",
+      "test/test_stats_contract.mjs"
+    ],
+    "python": [
+      "test/test_p0_layers.py",
+      "test/test_p0_leakage.py",
+      "test/test_p0_pairing_events.py"
+    ]
+  }
 }

@@ -631,6 +631,22 @@
     ['recordsExport', '导出', 'Export'],
     ['recordsAnalysis', '分析目录', 'Analyses'],
     ['recordsQuickExports', '快速导出', 'Quick export'],
+    ['contractTitle', '统计口径', 'Statistical contract'],
+    ['contractHint', '口径 = 数据集现状 + 最近一次预处理/统计的设计与阈值；随状态刷新，导出的 protocol/methods 同源。', 'Contract = dataset state + design and thresholds of the latest preprocessing/statistics; refreshes with state and matches the exported protocol/methods.'],
+    ['contractOk', '可引用', 'Citable'],
+    ['contractWarn', '待注意', 'Needs attention'],
+    ['contractNoResult', '还没有分析记录', 'No analysis yet'],
+    ['contractData', '数据', 'Data'],
+    ['contractGroups', '分组', 'Groups'],
+    ['contractScale', '尺度', 'Scale'],
+    ['contractQc', 'QC 样本', 'QC samples'],
+    ['contractBatch', '批次', 'Batch'],
+    ['contractWorkflow', '关键步骤参数', 'Key step parameters'],
+    ['contractInference', '最近分析', 'Latest analysis'],
+    ['contractCaveats', '引用前必须处理', 'Fix before citing'],
+    ['contractBatchDone', '已校正', 'corrected'],
+    ['contractBatchPending', '未校正', 'not corrected'],
+    ['contractMissing', '未取到', 'not captured'],
     ['recordsExporting', '导出中…', 'Exporting…'],
     ['auditHint', '得分不是模型评分，只是流程完整性检查；有问题按提示补齐', 'The score is not a model score; it only checks pipeline completeness'],
     ['auditOk', '通过', 'Pass'],
@@ -1469,6 +1485,110 @@
     }
   }
 
+  /** 工作台统计口径契约 → UI 模型（缺失一律 null，不编默认值）。 */
+  function normalizeStatsContract(payload) {
+    var raw = payload && typeof payload === 'object' ? payload : null
+    if (!raw) return null
+    var dataset = raw.dataset && typeof raw.dataset === 'object' ? raw.dataset : {}
+    var design = raw.design && typeof raw.design === 'object' ? raw.design : {}
+    var featureMeta = dataset.feature_meta && typeof dataset.feature_meta === 'object' ? dataset.feature_meta : {}
+    var identity = raw.identity && typeof raw.identity === 'object' ? raw.identity : {}
+    var inference = raw.inference && typeof raw.inference === 'object' ? raw.inference : null
+    var qc = design.qc && typeof design.qc === 'object' ? design.qc : {}
+    var nPerGroup = {}
+    if (design.n_per_group && typeof design.n_per_group === 'object') {
+      var groupKeys = Object.keys(design.n_per_group)
+      for (var groupIndex = 0; groupIndex < groupKeys.length; groupIndex++) {
+        nPerGroup[groupKeys[groupIndex]] = asNumber(design.n_per_group[groupKeys[groupIndex]])
+      }
+    }
+    var workflow = {}
+    var workflowRaw = raw.workflow && typeof raw.workflow === 'object' ? raw.workflow : {}
+    var workflowKeys = Object.keys(workflowRaw)
+    for (var workflowIndex = 0; workflowIndex < workflowKeys.length; workflowIndex++) {
+      var stepId = workflowKeys[workflowIndex]
+      var stepRaw = workflowRaw[stepId] && typeof workflowRaw[stepId] === 'object' ? workflowRaw[stepId] : {}
+      var params = {}
+      var paramKeys = Object.keys(stepRaw)
+      for (var paramIndex = 0; paramIndex < paramKeys.length; paramIndex++) {
+        var paramKey = paramKeys[paramIndex]
+        if (paramKey === 'at' || paramKey === 'ok') continue
+        params[paramKey] = stepRaw[paramKey]
+      }
+      workflow[stepId] = {
+        at: plainText(stepRaw.at || ''),
+        ok: stepRaw.ok !== false,
+        params: params,
+      }
+    }
+    return {
+      schema: plainText(raw.schema || ''),
+      plugin: plainText(raw.plugin || ''),
+      pluginVersion: plainText(raw.plugin_version || ''),
+      okToCite: raw.ok_to_cite === true,
+      dataset: {
+        id: plainText(dataset.id || ''),
+        name: plainText(dataset.name || ''),
+        nSamples: asNumber(dataset.n_samples),
+        nFeatures: asNumber(dataset.n_features),
+        species: plainText(dataset.species || ''),
+        polarity: plainText(dataset.polarity || ''),
+        valueKind: plainText(dataset.value_kind || ''),
+        sourceFormat: plainText(dataset.source_format || ''),
+        featureMeta: {
+          hasMz: featureMeta.has_mz === true,
+          hasRt: featureMeta.has_rt === true,
+          nAnnotated: asNumber(featureMeta.n_annotated),
+        },
+      },
+      design: {
+        groupKey: plainText(design.group_key || ''),
+        groups: Array.isArray(design.groups) ? design.groups.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+        nPerGroup: nPerGroup,
+        donorKey: plainText(design.donor_key || ''),
+        nDonors: asNumber(design.n_donors),
+        batchKey: plainText(design.batch_key || ''),
+        batchColumns: Array.isArray(design.batch_columns) ? design.batch_columns.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+        nBatches: asNumber(design.n_batches),
+        batchCorrected: design.batch_corrected === true,
+        qc: { nQc: asNumber(qc.n_qc), label: plainText(qc.label || '') },
+        sampleColumns: Array.isArray(design.sample_columns) ? design.sample_columns.map(function (item) { return plainText(item) }).filter(Boolean) : [],
+      },
+      inference: inference ? {
+        lastStep: plainText(inference.last_step || ''),
+        ok: inference.ok !== false,
+        at: plainText(inference.at || ''),
+        ms: asNumber(inference.ms),
+        summary: plainText(inference.summary || '', 400),
+        method: inference.method && typeof inference.method === 'object' ? inference.method : {},
+        designParams: inference.design && typeof inference.design === 'object' ? inference.design : {},
+        thresholds: inference.thresholds && typeof inference.thresholds === 'object' ? inference.thresholds : {},
+      } : null,
+      workflow: workflow,
+      recentAnalyses: Array.isArray(raw.recent_analyses) ? raw.recent_analyses.map(function (item) {
+        var entry = item && typeof item === 'object' ? item : {}
+        return {
+          analysis: plainText(entry.analysis || ''),
+          at: plainText(entry.at || ''),
+          ok: entry.ok !== false,
+          ms: asNumber(entry.ms),
+        }
+      }).filter(function (item) { return Boolean(item.analysis) }) : [],
+      identity: {
+        path: plainText(identity.path || ''),
+        fingerprint: plainText(identity.fingerprint || ''),
+        createdAt: plainText(identity.created_at || ''),
+        nStepsDone: asNumber(identity.n_steps_done),
+        nHistory: asNumber(identity.n_history),
+        nAnalyses: asNumber(identity.n_analyses),
+      },
+      caveats: Array.isArray(raw.caveats) ? raw.caveats.map(function (item) {
+        var entry = item && typeof item === 'object' ? item : {}
+        return { code: plainText(entry.code || ''), level: plainText(entry.level || 'info'), text: plainText(entry.text || '') }
+      }).filter(function (item) { return Boolean(item.text) }) : [],
+    }
+  }
+
   /** dataset 摘要归一化：服务端缺字段（老版本/引擎忙）时也能渲染（DESIGN §2.4）。 */
   function normalizeDataset(payload) {
     var raw = payload && typeof payload === 'object'
@@ -1528,6 +1648,8 @@
       },
       sample_columns: sampleColumns,
       group_column: plainText(raw.group_col || raw.group_column || ''),
+      group_key: plainText(raw.group_key || raw.group_col || raw.group_column || ''),
+      stats_contract: normalizeStatsContract(raw.stats_contract),
       steps: steps,
       current: plainText(raw.current || ''),
       warnings: normalizeStringList(raw.warnings),
@@ -2319,6 +2441,7 @@
     normalizeTable: normalizeTable,
     normalizeResult: normalizeResult,
     normalizeDataset: normalizeDataset,
+    normalizeStatsContract: normalizeStatsContract,
     normalizePreview: normalizePreview,
     normalizeHealth: normalizeHealth,
     normalizeState: normalizeState,
@@ -2658,6 +2781,20 @@
       '.mb-export-item:disabled{opacity:.5;cursor:default}',
       '.mb-export-hint{font-size:10px;color:var(--dsw-alias-label-tertiary)}',
 
+      /* 统计口径卡（记录页）：数据集现状 + 最近分析的设计/方法/阈值 + 引用前必须处理的项 */
+      '.mb-contract{display:flex;flex-direction:column;gap:5px}',
+      '.mb-contract-hint{font-size:11px;color:var(--dsw-alias-label-secondary);line-height:1.5}',
+      '.mb-contract-row{display:flex;gap:8px;font-size:12px;align-items:baseline}',
+      '.mb-contract-k{flex:0 0 88px;color:var(--dsw-alias-label-secondary)}',
+      '.mb-contract-v{flex:1 1 auto;color:var(--dsw-alias-label-primary);word-break:break-word}',
+      '.mb-contract-sub{display:flex;flex-direction:column;gap:2px;margin-top:2px;padding:6px 9px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1)}',
+      '.mb-contract-sub-title{font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary)}',
+      '.mb-contract-line{font-size:11px;line-height:1.5;color:var(--dsw-alias-label-primary);word-break:break-word}',
+      '.mb-contract-warn{margin-top:4px;padding:7px 9px;border-radius:8px;font-size:11.5px;line-height:1.5;background:var(--dsw-alias-bg-layer-2);border:1px solid color-mix(in srgb,var(--dsw-alias-state-warn-primary) 42%,var(--dsw-alias-border-l1))}',
+      '.mb-contract-warn-title{font-weight:600;margin-bottom:2px;color:var(--dsw-alias-state-warn-primary)}',
+      '.mb-contract-warn-item{color:var(--dsw-alias-label-primary)}',
+      '.mb-contract-info{margin-top:4px;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary)}',
+
       /* 右栏 Agent 面板 */
       '.mb-agent-section{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}',
       '.mb-agent-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10.5px;font-weight:600;letter-spacing:.05em;color:var(--dsw-alias-label-tertiary)}',
@@ -2880,6 +3017,116 @@
               props.extra ? h('span', null, props.extra) : null)
           : null,
         props.children)
+    }
+
+    /** 口径里的参数对象 → 「key=value · key=value」（数组按逗号，空值跳过）。 */
+    function contractParamText(source) {
+      var params = source && typeof source === 'object' ? source : {}
+      var keys = Object.keys(params)
+      var parts = []
+      for (var index = 0; index < keys.length; index++) {
+        var value = params[keys[index]]
+        if (isNil(value) || value === '') continue
+        var text = Array.isArray(value) ? value.join(',') : (value && typeof value === 'object' ? JSON.stringify(value) : String(value))
+        parts.push(keys[index] + '=' + text)
+      }
+      return parts.join(' · ')
+    }
+
+    /** 统计口径卡：数据集现状 + 最近分析的设计/方法/阈值 + 引用前必须处理的项。 */
+    function StatsContractCard(props) {
+      var contract = props.contract || null
+      function kv(label, value) {
+        if (!value) return null
+        return h('div', { className: 'mb-contract-row' },
+          h('span', { className: 'mb-contract-k' }, label),
+          h('span', { className: 'mb-contract-v' }, value))
+      }
+      var badge = contract
+        ? h('span', { className: 'mb-badge ' + (contract.okToCite ? 'mb-badge-ok' : 'mb-badge-warn') },
+            h('span', { className: 'mb-badge-dot' }),
+            contract.okToCite ? T('contractOk') : T('contractWarn'))
+        : null
+      if (!contract) {
+        return h(SectionCard, { title: T('contractTitle'), extra: badge },
+          h('div', { className: 'mb-muted' }, T('contractHint')))
+      }
+      var dataset = contract.dataset || {}
+      var design = contract.design || {}
+      var inference = contract.inference
+      var workflow = contract.workflow || {}
+      var warns = (contract.caveats || []).filter(function (item) { return item.level === 'warn' })
+      var infos = (contract.caveats || []).filter(function (item) { return item.level !== 'warn' })
+      var dataText = [
+        (isNil(dataset.nSamples) ? '?' : fmtNumber(dataset.nSamples)) + ' ' + T('samples'),
+        (isNil(dataset.nFeatures) ? '?' : fmtNumber(dataset.nFeatures)) + ' ' + T('features'),
+        dataset.species, dataset.polarity,
+      ].filter(Boolean).join(' · ')
+      var groupText = (design.groups || []).map(function (name) {
+        var count = design.nPerGroup ? design.nPerGroup[name] : null
+        return name + ' ' + (isNil(count) ? '?' : fmtNumber(count))
+      }).join(' / ')
+      var groupLine = [groupText, design.groupKey ? '（' + design.groupKey + '）' : '',
+        !isNil(design.nDonors) ? '供体 ' + fmtNumber(design.nDonors) : ''].filter(Boolean).join(' ')
+      var scaleText = [
+        dataset.valueKind ? dataset.valueKind : T('contractMissing'),
+        dataset.featureMeta && dataset.featureMeta.hasMz ? 'm/z' : '',
+        dataset.featureMeta && dataset.featureMeta.hasRt ? 'RT' : '',
+        !isNil(dataset.featureMeta && dataset.featureMeta.nAnnotated) ? '注释 ' + fmtNumber(dataset.featureMeta.nAnnotated) : '',
+      ].filter(Boolean).join(' · ')
+      var qcText = isNil(design.qc && design.qc.nQc)
+        ? T('contractMissing')
+        : 'n=' + fmtNumber(design.qc.nQc) + (design.qc.label ? ' · 标签 ' + design.qc.label : '')
+      var batchText = design.batchKey
+        ? [design.batchKey,
+            !isNil(design.nBatches) ? fmtNumber(design.nBatches) + ' 批次' : '',
+            design.batchCorrected ? T('contractBatchDone') : T('contractBatchPending')].filter(Boolean).join(' · ')
+        : T('contractMissing')
+      var inferenceText = inference
+        ? [((stepById(inference.lastStep) || {}).title || inference.lastStep || T('contractNoResult')),
+            inference.ok ? T('completed') : T('failed'),
+            isNil(inference.ms) ? '' : formatDuration(inference.ms),
+            contractParamText(inference.method),
+            contractParamText(inference.thresholds)].filter(Boolean).join(' · ')
+        : T('contractNoResult')
+      var workflowLines = []
+      var order = ['qc', 'filter', 'normalize', 'transform', 'pca', 'plsda', 'de', 'batch', 'enrich', 'biomarker']
+      for (var index = 0; index < order.length; index++) {
+        var stepId = order[index]
+        var entry = workflow[stepId]
+        if (!entry) continue
+        var paramsText = contractParamText(entry.params)
+        workflowLines.push(((stepById(stepId) || {}).title || stepId) + (paramsText ? '：' + paramsText : ''))
+      }
+      return h(SectionCard, { title: T('contractTitle'), extra: badge },
+        h('div', { className: 'mb-contract' },
+          h('div', { className: 'mb-contract-hint' }, T('contractHint')),
+          kv(T('contractData'), dataText),
+          kv(T('contractGroups'), groupLine || T('contractMissing')),
+          kv(T('contractScale'), scaleText),
+          kv(T('contractQc'), qcText),
+          kv(T('contractBatch'), batchText),
+          kv(T('contractInference'), inferenceText),
+          workflowLines.length
+            ? h('div', { className: 'mb-contract-sub' },
+              h('div', { className: 'mb-contract-sub-title' }, T('contractWorkflow')),
+              workflowLines.map(function (line, lineIndex) {
+                return h('div', { key: 'wf-' + lineIndex, className: 'mb-contract-line' }, '· ' + line)
+              }))
+            : null,
+          warns.length
+            ? h('div', { className: 'mb-contract-warn' },
+              h('div', { className: 'mb-contract-warn-title' }, T('contractCaveats') + '（' + warns.length + '）'),
+              warns.map(function (item, warnIndex) {
+                return h('div', { key: 'cw-' + warnIndex, className: 'mb-contract-warn-item' }, '· ' + item.text)
+              }))
+            : null,
+          infos.length
+            ? h('div', { className: 'mb-contract-info' },
+              infos.map(function (item, infoIndex) {
+                return h('div', { key: 'ci-' + infoIndex }, '· ' + item.text)
+              }))
+            : null))
     }
 
     /** 单张图：加载 / 失败 / 空态 / 图片（点击在新标签打开原图）。 */
@@ -4217,6 +4464,7 @@
               h('span', { className: 'mb-export-hint' }, state.file ? state.file : item.hint),
               state.error ? h('span', { className: 'mb-warn-text' }, state.error) : null)
           }))),
+        h(StatsContractCard, { contract: dataset ? dataset.stats_contract : null }),
         h(Notice, { text: T('auditHint') }))
     }
 
